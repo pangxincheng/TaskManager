@@ -9,7 +9,6 @@ setup(
     packages=[package for package in find_packages()],
     requires=[
         "pycuda",
-        "pynvml",
         "pyzmq",
         "rich",
         "cmd2",
