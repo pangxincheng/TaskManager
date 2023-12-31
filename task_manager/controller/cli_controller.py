@@ -46,7 +46,7 @@ class CLIController(cmd2.Cmd):
         )
         time.sleep(1)
 
-    @cmd2.with_argparser(argparse.ArgumentParser())
+    @cmd2.with_argparser(cmd2.Cmd2ArgumentParser())
     def do_exit(self, args):
         """Exit the application."""
         self.logger.info("=> [info] exit cli server...")
@@ -59,7 +59,7 @@ class CLIController(cmd2.Cmd):
         self.client.close()
         return True
 
-    ggibi_parser = argparse.ArgumentParser()
+    ggibi_parser = cmd2.Cmd2ArgumentParser()
     ggibi_parser.add_argument("--identities", type=str, nargs="+", default=[], help="identities")
     ggibi_parser.add_argument("--info_level", type=str, default="simple", help="simple or detail", choices=["simple", "detail"])
     @cmd2.with_argparser(ggibi_parser)
@@ -76,7 +76,7 @@ class CLIController(cmd2.Cmd):
         msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
         rich.print(msg)
 
-    ggibdi_parser = argparse.ArgumentParser()
+    ggibdi_parser = cmd2.Cmd2ArgumentParser()
     ggibdi_parser.add_argument("--device_ids", type=int, nargs="+", default=[], help="device ids")
     ggibdi_parser.add_argument("--info_level", type=str, default="simple", help="simple or detail", choices=["simple", "detail"])
     @cmd2.with_argparser(ggibdi_parser)
@@ -93,7 +93,7 @@ class CLIController(cmd2.Cmd):
         msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
         rich.print(msg)
 
-    start_wdbdi_parser = argparse.ArgumentParser()
+    start_wdbdi_parser = cmd2.Cmd2ArgumentParser()
     start_wdbdi_parser.add_argument("--device_ids", type=int, nargs="+", help="device ids")
     @cmd2.with_argparser(start_wdbdi_parser)
     def do_start_watch_dog_by_device_ids(self, args):
@@ -108,7 +108,7 @@ class CLIController(cmd2.Cmd):
         msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
         rich.print(msg)
 
-    stop_wdbi_parser = argparse.ArgumentParser()
+    stop_wdbi_parser = cmd2.Cmd2ArgumentParser()
     stop_wdbi_parser.add_argument("--identities", type=str, nargs="+", default=[], help="identities")
     @cmd2.with_argparser(stop_wdbi_parser)
     def do_stop_watch_dog_by_identities(self, args):
@@ -123,7 +123,7 @@ class CLIController(cmd2.Cmd):
         msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
         rich.print(msg)
 
-    mabi_parser = argparse.ArgumentParser()
+    mabi_parser = cmd2.Cmd2ArgumentParser()
     mabi_parser.add_argument("--identities", type=str, nargs="+", help="device ids")
     mabi_parser.add_argument("--chunk_sizes", type=int, nargs="+", help="chun size")
     mabi_parser.add_argument("--max_sizes", type=int, nargs="+", help="max size")
@@ -144,7 +144,7 @@ class CLIController(cmd2.Cmd):
         msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
         rich.print(msg)
 
-    mrbi_parser = argparse.ArgumentParser()
+    mrbi_parser = cmd2.Cmd2ArgumentParser()
     mrbi_parser.add_argument("--identities", type=str, nargs="+", help="device ids")
     mrbi_parser.add_argument("--mem_sizes", type=int, nargs="+", help="chun size")
     mrbi_parser.add_argument("--units", type=str, nargs="+", help="unit", choices=["B", "KiB", "MiB", "GiB"])
@@ -163,7 +163,7 @@ class CLIController(cmd2.Cmd):
         msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
         rich.print(msg)
 
-    start_pbi_parser = argparse.ArgumentParser()
+    start_pbi_parser = cmd2.Cmd2ArgumentParser()
     start_pbi_parser.add_argument("--identities", type=str, nargs="+", help="device ids")
     start_pbi_parser.add_argument("--chunk_sizes", type=int, nargs="+", help="chun size")
     start_pbi_parser.add_argument("--max_sizes", type=int, nargs="+", help="max size")
@@ -186,7 +186,7 @@ class CLIController(cmd2.Cmd):
         msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
         rich.print(msg)
 
-    stop_pbi_parser = argparse.ArgumentParser()
+    stop_pbi_parser = cmd2.Cmd2ArgumentParser()
     stop_pbi_parser.add_argument("--identities", type=str, nargs="+", help="device ids")
     @cmd2.with_argparser(stop_pbi_parser)
     def do_stop_preemptive_by_identities(self, args):
@@ -201,10 +201,10 @@ class CLIController(cmd2.Cmd):
         msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
         rich.print(msg)
 
-    at_parser = argparse.ArgumentParser()
-    at_parser.add_argument("--stdout_file", type=str, required=True, help="stdout file")
-    at_parser.add_argument("--stderr_file", type=str, required=True, help="stderr file")
-    at_parser.add_argument("user_args", nargs=argparse.REMAINDER, help="user args")
+    at_parser = cmd2.Cmd2ArgumentParser()
+    at_parser.add_argument("--stdout_file", type=str, completer=cmd2.Cmd.path_complete, required=True, help="stdout file")
+    at_parser.add_argument("--stderr_file", type=str, completer=cmd2.Cmd.path_complete, required=True, help="stderr file")
+    at_parser.add_argument("user_args", nargs=argparse.REMAINDER, completer=cmd2.Cmd.path_complete, help="user args")
     @cmd2.with_argparser(at_parser)
     def do_add_task(self, args):
         """Add task."""
@@ -220,8 +220,8 @@ class CLIController(cmd2.Cmd):
         msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
         rich.print(msg)
 
-    rt_parser = argparse.ArgumentParser()
-    rt_parser.add_argument("task_ids", type=int, nargs="+", help="task id")
+    rt_parser = cmd2.Cmd2ArgumentParser()
+    rt_parser.add_argument("--identities", type=str, nargs="+", default=[], help="task id")
     @cmd2.with_argparser(rt_parser)
     def do_remove_tasks(self, args):
         """Remove tasks."""
@@ -229,13 +229,13 @@ class CLIController(cmd2.Cmd):
         self.client.send_binary(common_utils.dict_to_byte_msg({
             "function": "remove_tasks",
             "kwargs": {
-                "task_ids": args.task_ids,
+                "identities": args.identities,
             },
         }))
         msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
         rich.print(msg)
 
-    gtibi_parser = argparse.ArgumentParser()
+    gtibi_parser = cmd2.Cmd2ArgumentParser()
     gtibi_parser.add_argument("--identities", type=str, nargs="+", default=[], help="task id")
     @cmd2.with_argparser(gtibi_parser)
     def do_get_task_info_by_identities(self, args):
