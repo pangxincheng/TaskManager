@@ -411,6 +411,7 @@ class CoreManager(mp.Process):
         identity = common_utils.md5("_".join(user_args) + timestamp)
         watchdog = TaskManager(
             identity=identity,
+            core_manager_addr=self.core_manager_addr,
             task_manager_addr=self.task_manager_addr,
             user_args=user_args,
             stdout_file=stdout_file,
@@ -430,6 +431,20 @@ class CoreManager(mp.Process):
             "status": 200,
             "result": {
                 identity: msg
+            }
+        }
+
+    def remove_task_by_task_daemon(self, identity: str, msg: str, return_code: int) -> Dict[str, Any]:
+        assert identity in self.watched_tasks.keys(), "The identity should be in the valid range"
+        watchdog = self.watched_tasks[identity]["watchdog"]
+        watchdog.join()
+        del self.watched_tasks[identity]
+        return {
+            "status": 200,
+            "result": {
+                "identity": identity,
+                "msg": msg,
+                "return_code": return_code,
             }
         }
 

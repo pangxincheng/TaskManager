@@ -15,20 +15,52 @@ class TaskManager(mp.Process):
     def __init__(
         self, 
         identity: str, 
+        core_manager_addr: str,
         task_manager_addr: str,
         user_args: str,
         stdout_file: str,
         stderr_file: str,
     ) -> None:
         mp.Process.__init__(self, daemon=True)
+        assert core_manager_addr.startswith("tcp://") or core_manager_addr.startswith("ipc://"), \
+            "core_manager_addr must start with tcp:// or ipc://"
         assert task_manager_addr.startswith("tcp://") or task_manager_addr.startswith("ipc://"), \
             "task_manager_addr must start with tcp:// or ipc://"
         self.identity = identity
+        self.core_manager_addr = core_manager_addr
         self.task_manager_addr = task_manager_addr
         self.user_args = user_args
+        self.process_lock = threading.Lock()
         self.process = None
         self.stdout_file = stdout_file
         self.stderr_file = stderr_file
+
+    def daemon_fn(self):
+        daemon_client = zmq_utils.ZMQClient(
+            addr=self.core_manager_addr,
+            identity=self.identity,
+        )
+        time.sleep(1)
+        while self.running:
+            poll_status = None
+            with self.process_lock:
+                if self.process is not None:
+                    poll_status = self.process.poll()
+            if poll_status is not None:
+                daemon_client.send_binary(
+                    any=common_utils.dict_to_byte_msg({
+                        "function": "remove_task_by_task_daemon",
+                        "kwargs": {
+                            "identity": self.identity,
+                            "msg": "Task finished",
+                            "return_code": poll_status,
+                        }
+                    })
+                )
+                msg = daemon_client.recv_binary()[0]
+                self.running = False
+            else:
+                time.sleep(5)
 
     def signal_handler(self, signum, frame):
         exit(0)
@@ -57,6 +89,9 @@ class TaskManager(mp.Process):
             "status": 200,
             "result": f"Success start a watching dog🐶 to run {' '.join(self.user_args)}"
         }))
+        time.sleep(1)
+        self.daemon_thread = threading.Thread(target=self.daemon_fn, daemon=True)
+        self.daemon_thread.start()
 
     def run(self):
         self._init_manager()
@@ -86,8 +121,9 @@ class TaskManager(mp.Process):
 
     def exit(self):
         self.running = False
-        os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-        return_code = self.process.wait()
+        with self.process_lock:
+            os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+            return_code = self.process.wait()
         self.stdout.close()
         if self.stdout_file != self.stderr_file:
             self.stderr.close()
@@ -100,7 +136,11 @@ class TaskManager(mp.Process):
         }
 
     def get_status(self):
-        if self.process.poll() is None:
+        process_status = None
+        with self.process_lock:
+            if self.process is not None:
+                process_status = self.process.poll()
+        if process_status is None:
             return {
                 "status": 200,
                 "result": {
