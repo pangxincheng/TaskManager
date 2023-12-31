@@ -436,8 +436,17 @@ class CoreManager(mp.Process):
 
     def remove_task_by_task_daemon(self, identity: str, msg: str, return_code: int) -> Dict[str, Any]:
         assert identity in self.watched_tasks.keys(), "The identity should be in the valid range"
-        watchdog = self.watched_tasks[identity]["watchdog"]
-        watchdog.join()
+        self._task_manager.send_binary(
+            any=common_utils.dict_to_byte_msg({
+                "function": "exit",
+            }),
+            identity=identity
+        )
+        identity_, msg = self._task_manager.recv_binary()
+        identity_ = identity_.decode("utf-8")
+        msg = common_utils.byte_msg_to_dict(msg)
+        assert identity == identity_, "identity mismatch"
+        self.watched_tasks[identity]["watchdog"].join()
         del self.watched_tasks[identity]
         return {
             "status": 200,

@@ -203,7 +203,7 @@ class CLIController(cmd2.Cmd):
 
     at_parser = cmd2.Cmd2ArgumentParser()
     at_parser.add_argument("--stdout_file", type=str, completer=cmd2.Cmd.path_complete, required=True, help="stdout file")
-    at_parser.add_argument("--stderr_file", type=str, completer=cmd2.Cmd.path_complete, required=True, help="stderr file")
+    at_parser.add_argument("--stderr_file", type=str, completer=cmd2.Cmd.path_complete, default=None, help="stderr file")
     at_parser.add_argument("user_args", nargs=argparse.REMAINDER, completer=cmd2.Cmd.path_complete, help="user args")
     @cmd2.with_argparser(at_parser)
     def do_add_task(self, args):
@@ -214,7 +214,7 @@ class CLIController(cmd2.Cmd):
             "kwargs": {
                 "user_args": args.user_args,
                 "stdout_file": args.stdout_file,
-                "stderr_file": args.stderr_file,
+                "stderr_file": args.stderr_file if args.stderr_file is not None else args.stdout_file,
             },
         }))
         msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])

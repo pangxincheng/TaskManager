@@ -30,7 +30,7 @@ class TaskManager(mp.Process):
         self.core_manager_addr = core_manager_addr
         self.task_manager_addr = task_manager_addr
         self.user_args = user_args
-        self.process_lock = threading.Lock()
+        self.process_lock = None
         self.process = None
         self.stdout_file = stdout_file
         self.stderr_file = stderr_file
@@ -57,7 +57,6 @@ class TaskManager(mp.Process):
                         }
                     })
                 )
-                msg = daemon_client.recv_binary()[0]
                 self.running = False
             else:
                 time.sleep(5)
@@ -79,6 +78,7 @@ class TaskManager(mp.Process):
             self.stderr = self.stdout
         else:
             self.stderr = open(self.stderr_file, "wb")
+        self.process_lock = threading.Lock()
         self.process = subprocess.Popen(
             self.user_args,
             stdout=self.stdout,
