@@ -17,10 +17,14 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-## Usage
+## Usage Demo
+### Server
+```shell
+python -m task_manager.main --type server
+```
 ### CLI Controller
 ```shell
-python -m task_manager.main
+python -m task_manager.main --type client
 ```
 It will start a CLI program (enter `help` for more prompts), through which you can manage your tasks and GPUs.
 
@@ -31,3 +35,4 @@ This repository uses the following libraries:
 - [rich](https://github.com/Textualize/rich): A Python library for rich text and beautiful formatting in the terminal
 - [pycuda](https://github.com/inducer/pycuda): A library that lets you access Nvidia's CUDA parallel computation API from Python
 - [pyzmq](https://github.com/zeromq/pyzmq): Python bindings for ØMQ (a lightweight and fast messaging implementation)
+- [pynvml]

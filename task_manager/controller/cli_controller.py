@@ -1,251 +1,230 @@
 import os
 import cmd2
+import json
 import time
 import rich
 import signal
 import argparse
 
-import task_manager.utils.zmq_utils as zmq_utils
-import task_manager.utils.common_utils as common_utils
+from task_manager.core.client import Client
 
-def exit(signum, frame):
-    rich.print("=> [bold red]\[ERROR][/bold red] please use [italic blue]exit[/italic blue] to exit the cli controller🤗")
-signal.signal(signal.SIGINT, exit)
-signal.signal(signal.SIGTERM, exit)
-
-class CLIController(cmd2.Cmd):
+class CliController(cmd2.Cmd):
 
     def __init__(
         self,
-        core_manager_addr: str,
-        log_dir: str="logs",
-        log_level: str="INFO",
+        broker_addr: str,
+        logger_addr: str,
     ):
         super().__init__()
         self.prompt = "(🚀task_manager)> "
-        self.core_manager_addr = core_manager_addr
-        self.log_dir = log_dir
-        self.log_level = log_level
-        self.logger = None
-        self.client = None
-        self.identity = "cli_controller"
+        self.broker_addr = broker_addr
+        self.logger_addr = logger_addr
+        self.client = Client("cli", self.broker_addr, self.logger_addr)
 
-        self._init_controller()
-
-    def _init_controller(self):
-        self.logger = common_utils.get_logger(
-            logger_name="cli_controller",
-            log_level=self.log_level,
-            handler=os.path.join(self.log_dir, "cli_controller.log")
-        )
-
-        self.logger.info("init core client")
-        self.client = zmq_utils.ZMQClient(
-            addr=self.core_manager_addr,
-            identity=self.identity
-        )
-        time.sleep(1)
+    def _parse_device_ids(self, device_ids: list[str]):
+        node_to_device_ids = {}
+        for device_id in device_ids:
+            node, device_ids = device_id.split(":")
+            node = f"{node}-gpu"
+            if "," in device_ids:
+                device_ids = device_ids.split(",")
+                device_ids = [int(device_id) for device_id in device_ids]
+            elif "-" in device_id:
+                device_ids = device_ids.split("-")
+                device_ids = list(range(int(device_ids[0]), int(device_ids[1])+1))
+            else:
+                device_ids = [int(device_ids)]
+            if node not in node_to_device_ids:
+                node_to_device_ids[node] = []
+            node_to_device_ids[node].extend(device_ids)
+        return node_to_device_ids
 
     @cmd2.with_argparser(cmd2.Cmd2ArgumentParser())
     def do_exit(self, args):
         """Exit the application."""
-        self.logger.info("=> [info] exit cli server...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "exit",
-            "kwargs": {},
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
-        rich.print(msg)
-        self.client.close()
         return True
-
-    ggibi_parser = cmd2.Cmd2ArgumentParser()
-    ggibi_parser.add_argument("--identities", type=str, nargs="+", default=[], help="identities")
-    ggibi_parser.add_argument("--info_level", type=str, default="simple", help="simple or detail", choices=["simple", "detail"])
-    @cmd2.with_argparser(ggibi_parser)
-    def do_get_gpus_info_by_identities(self, args):
-        """Get gpu information by identities."""
-        self.logger.info("=> [info] get gpu information by identities...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "get_gpus_info_by_identities",
-            "kwargs": {
-                "identities": args.identities,
-                "info_level": args.info_level
-            },
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
+    
+    ggi_parser = cmd2.Cmd2ArgumentParser()
+    ggi_parser.add_argument("--device_ids", type=str, nargs="+", help="eg: 127.0.0.1:0 or 127.0.0.1:0,2 or 127.0.0.1:0-3")
+    @cmd2.with_argparser(ggi_parser)
+    def do_get_gpu_info(self, args):
+        """Get GPU info."""
+        node_to_device_ids = self._parse_device_ids(args.device_ids)
+        return_msg = {}
+        for node, device_ids in node_to_device_ids.items():
+            msg = self.client.send(
+                service_name=f"/api/{node}/get_gpu_info".encode(),
+                request=[
+                    json.dumps({
+                        "device_ids": sorted(set(device_ids))
+                    }).encode()
+                ]
+            )
+            msg = json.loads(msg[0])
+            return_msg[node.split("-")[0]] = msg
+        rich.print(return_msg)
+            
+    awd_parser = cmd2.Cmd2ArgumentParser()
+    awd_parser.add_argument("--device_ids", type=str, nargs="+", help="eg: 127.0.0.1:0 or 127.0.0.1:0,2 or 127.0.0.1:0-3")
+    @cmd2.with_argparser(awd_parser)
+    def do_add_watchdog(self, args):
+        """Add watchdog."""
+        node_to_device_ids = self._parse_device_ids(args.device_ids)
+        return_msg = {}
+        for node, device_ids in node_to_device_ids.items():
+            msg = self.client.send(
+                service_name=f"/api/{node}/add_watchdog".encode(),
+                request=[
+                    json.dumps({
+                        "device_ids": sorted(set(device_ids))
+                    }).encode()
+                ]
+            )
+            msg = json.loads(msg[0])
+            return_msg[node.split("-")[0]] = msg
         rich.print(msg)
 
-    ggibdi_parser = cmd2.Cmd2ArgumentParser()
-    ggibdi_parser.add_argument("--device_ids", type=int, nargs="+", default=[], help="device ids")
-    ggibdi_parser.add_argument("--info_level", type=str, default="simple", help="simple or detail", choices=["simple", "detail"])
-    @cmd2.with_argparser(ggibdi_parser)
-    def do_get_gpus_info_by_device_ids(self, args):
-        """Get gpu information."""
-        self.logger.info("=> [info] get gpu information...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "get_gpus_info_by_device_ids",
-            "kwargs": {
-                "device_ids": args.device_ids,
-                "info_level": args.info_level
-            },
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
+    rwd_parser = cmd2.Cmd2ArgumentParser()
+    rwd_parser.add_argument("--device_ids", type=str, nargs="+", help="eg: 127.0.0.1:0 or 127.0.0.1:0,2 or 127.0.0.1:0-3")
+    @cmd2.with_argparser(rwd_parser)
+    def do_remove_watchdog(self, args):
+        """Remove watchdog."""
+        node_to_device_ids = self._parse_device_ids(args.device_ids)
+        return_msg = {}
+        for node, device_ids in node_to_device_ids.items():
+            msg = self.client.send(
+                service_name=f"/api/{node}/remove_watchdog".encode(),
+                request=[
+                    json.dumps({
+                        "device_ids": sorted(set(device_ids))
+                    }).encode()
+                ]
+            )
+            msg = json.loads(msg[0])
+            return_msg[node.split("-")[0]] = msg
         rich.print(msg)
 
-    start_wdbdi_parser = cmd2.Cmd2ArgumentParser()
-    start_wdbdi_parser.add_argument("--device_ids", type=int, nargs="+", help="device ids")
-    @cmd2.with_argparser(start_wdbdi_parser)
-    def do_start_watch_dog_by_device_ids(self, args):
-        """Start watch dog by device ids."""
-        self.logger.info("=> [info] start watch dog by device ids...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "start_watch_dog_by_device_ids",
-            "kwargs": {
-                "device_ids": args.device_ids
-            },
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
+    am_parser = cmd2.Cmd2ArgumentParser()
+    am_parser.add_argument("--device_ids", type=str, nargs="+", help="eg: 127.0.0.1:0 or 127.0.0.1:0,2 or 127.0.0.1:0-3")
+    am_parser.add_argument("--mem_size", type=int)
+    am_parser.add_argument("--unit", type=str, choices=["B", "KiB", "MiB", "GiB"])
+    @cmd2.with_argparser(am_parser)
+    def do_allocate_memory(self, args):
+        """Allocate memory."""
+        node_to_device_ids = self._parse_device_ids(args.device_ids)
+        return_msg = {}
+        for node, device_ids in node_to_device_ids.items():
+            msg = self.client.send(
+                service_name=f"/api/{node}/allocate_memory".encode(),
+                request=[
+                    json.dumps({
+                        "device_ids": sorted(set(device_ids)),
+                        "mem_sizes": [args.mem_size for _ in range(len(device_ids))],
+                        "units": [args.unit for _ in range(len(device_ids))]
+                    }).encode()
+                ]
+            )
+            msg = json.loads(msg[0])
+            return_msg[node.split("-")[0]] = msg
         rich.print(msg)
 
-    stop_wdbi_parser = cmd2.Cmd2ArgumentParser()
-    stop_wdbi_parser.add_argument("--identities", type=str, nargs="+", default=[], help="identities")
-    @cmd2.with_argparser(stop_wdbi_parser)
-    def do_stop_watch_dog_by_identities(self, args):
-        """Stop watch dog by identities."""
-        self.logger.info("=> [info] stop watch dog by identities...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "stop_watch_dog_by_identities",
-            "kwargs": {
-                "identities": args.identities
-            },
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
+    pm_parser = cmd2.Cmd2ArgumentParser()
+    pm_parser.add_argument("--device_ids", type=str, nargs="+", help="eg: 127.0.0.1:0 or 127.0.0.1:0,2 or 127.0.0.1:0-3")
+    pm_parser.add_argument("--mem_size", type=int)
+    pm_parser.add_argument("--unit", type=str, choices=["B", "KiB", "MiB", "GiB"])
+    @cmd2.with_argparser(pm_parser)
+    def do_preempt_memory(self, args):
+        """Preempt memory."""
+        node_to_device_ids = self._parse_device_ids(args.device_ids)
+        return_msg = {}
+        for node, device_ids in node_to_device_ids.items():
+            msg = self.client.send(
+                service_name=f"/api/{node}/preempt_memory".encode(),
+                request=[
+                    json.dumps({
+                        "device_ids": sorted(set(device_ids)),
+                        "mem_sizes": [args.mem_size for _ in range(len(device_ids))],
+                        "units": [args.unit for _ in range(len(device_ids))]
+                    }).encode()
+                ]
+            )
+            msg = json.loads(msg[0])
+            return_msg[node.split("-")[0]] = msg
         rich.print(msg)
 
-    mabi_parser = cmd2.Cmd2ArgumentParser()
-    mabi_parser.add_argument("--identities", type=str, nargs="+", help="device ids")
-    mabi_parser.add_argument("--chunk_sizes", type=int, nargs="+", help="chun size")
-    mabi_parser.add_argument("--max_sizes", type=int, nargs="+", help="max size")
-    mabi_parser.add_argument("--units", type=str, nargs="+", help="unit", choices=["B", "KiB", "MiB", "GiB"])
-    @cmd2.with_argparser(mabi_parser)
-    def do_mem_alloc_by_identities(self, args):
-        """Memory allocation by identities."""
-        self.logger.info("=> [info] memory allocation by identities...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "mem_alloc_by_identities",
-            "kwargs": {
-                "identities": args.identities,
-                "chunk_sizes": args.chunk_sizes,
-                "max_sizes": args.max_sizes,
-                "units": args.units,
-            },
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
+    apm_parser = cmd2.Cmd2ArgumentParser()
+    apm_parser.add_argument("--device_ids", type=str, nargs="+", help="eg: 127.0.0.1:0 or 127.0.0.1:0,2 or 127.0.0.1:0-3")
+    apm_parser.add_argument("--mem_size", type=int)
+    apm_parser.add_argument("--unit", type=str, choices=["B", "KiB", "MiB", "GiB"])
+    @cmd2.with_argparser(apm_parser)
+    def do_auto_preempt_memory(self, args):
+        """Auto preempt memory."""
+        node_to_device_ids = self._parse_device_ids(args.device_ids)
+        return_msg = {}
+        for node, device_ids in node_to_device_ids.items():
+            msg = self.client.send(
+                service_name=f"/api/{node}/auto_preempt_memory".encode(),
+                request=[
+                    json.dumps({
+                        "device_ids": sorted(set(device_ids)),
+                        "mem_sizes": [args.mem_size for _ in range(len(device_ids))],
+                        "units": [args.unit for _ in range(len(device_ids))]
+                    }).encode()
+                ]
+            )
+            msg = json.loads(msg[0])
+            return_msg[node.split("-")[0]] = msg
         rich.print(msg)
 
-    mrbi_parser = cmd2.Cmd2ArgumentParser()
-    mrbi_parser.add_argument("--identities", type=str, nargs="+", help="device ids")
-    mrbi_parser.add_argument("--mem_sizes", type=int, nargs="+", help="chun size")
-    mrbi_parser.add_argument("--units", type=str, nargs="+", help="unit", choices=["B", "KiB", "MiB", "GiB"])
-    @cmd2.with_argparser(mrbi_parser)
-    def do_mem_release_by_identities(self, args):
-        """Memory release by identities."""
-        self.logger.info("=> [info] memory release by identities...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "mem_release_by_identities",
-            "kwargs": {
-                "identities": args.identities,
-                "mem_sizes": args.mem_sizes,
-                "units": args.units,
-            },
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
+    ct_parser = cmd2.Cmd2ArgumentParser()
+    ct_parser.add_argument("--stdout", type=str, default=None)
+    ct_parser.add_argument("--stderr", type=str, default=None)
+    ct_parser.add_argument('args', nargs=argparse.REMAINDER)
+    @cmd2.with_argparser(ct_parser)
+    def do_create_task(self, args):
+        """Create task."""
+        msg = self.client.send(
+            service_name="/api/task/create_task".encode(),
+            request=[
+                json.dumps({
+                    "stdout": args.stdout,
+                    "stderr": args.stderr,
+                    "args": args.args
+                }).encode()
+            ]
+        )
+        msg = json.loads(msg[0])
+        rich.print(msg)
+    
+   
+    kt_parser = cmd2.Cmd2ArgumentParser()
+    kt_parser.add_argument("--task_ids", type=str, nargs="+")
+    @cmd2.with_argparser(kt_parser)
+    def do_kill_task(self, args):
+        """Kill task."""
+        msg = self.client.send(
+            service_name="/api/task/kill_task".encode(),
+            request=[
+                json.dumps({
+                    "task_ids": args.task_ids
+                }).encode()
+            ]
+        )
+        msg = json.loads(msg[0])
         rich.print(msg)
 
-    start_pbi_parser = cmd2.Cmd2ArgumentParser()
-    start_pbi_parser.add_argument("--identities", type=str, nargs="+", help="device ids")
-    start_pbi_parser.add_argument("--chunk_sizes", type=int, nargs="+", help="chun size")
-    start_pbi_parser.add_argument("--max_sizes", type=int, nargs="+", help="max size")
-    start_pbi_parser.add_argument("--units", type=str, nargs="+", help="unit", choices=["B", "KiB", "MiB", "GiB"])
-    start_pbi_parser.add_argument("--auto_close", action="store_true", help="auto close")
-    @cmd2.with_argparser(start_pbi_parser)
-    def do_start_preemptive_by_identities(self, args):
-        """Start preemptive by identities."""
-        self.logger.info("=> [info] start preemptive...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "start_preemptive_by_identities",
-            "kwargs": {
-                "identities": args.identities,
-                "chunk_sizes": args.chunk_sizes,
-                "max_sizes": args.max_sizes,
-                "units": args.units,
-                "auto_close": args.auto_close,
-            },
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
-        rich.print(msg)
-
-    stop_pbi_parser = cmd2.Cmd2ArgumentParser()
-    stop_pbi_parser.add_argument("--identities", type=str, nargs="+", help="device ids")
-    @cmd2.with_argparser(stop_pbi_parser)
-    def do_stop_preemptive_by_identities(self, args):
-        """Stop preemptive by identities."""
-        self.logger.info("=> [info] stop preemptive...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "stop_preemptive_by_identities",
-            "kwargs": {
-                "identities": args.identities,
-            },
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
-        rich.print(msg)
-
-    at_parser = cmd2.Cmd2ArgumentParser()
-    at_parser.add_argument("--stdout_file", type=str, completer=cmd2.Cmd.path_complete, required=True, help="stdout file")
-    at_parser.add_argument("--stderr_file", type=str, completer=cmd2.Cmd.path_complete, default=None, help="stderr file")
-    at_parser.add_argument("user_args", nargs=argparse.REMAINDER, completer=cmd2.Cmd.path_complete, help="user args")
-    @cmd2.with_argparser(at_parser)
-    def do_add_task(self, args):
-        """Add task."""
-        self.logger.info("=> [info] add task...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "add_task",
-            "kwargs": {
-                "user_args": args.user_args,
-                "stdout_file": args.stdout_file,
-                "stderr_file": args.stderr_file if args.stderr_file is not None else args.stdout_file,
-            },
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
-        rich.print(msg)
-
-    rt_parser = cmd2.Cmd2ArgumentParser()
-    rt_parser.add_argument("--identities", type=str, nargs="+", default=[], help="task id")
-    @cmd2.with_argparser(rt_parser)
-    def do_remove_tasks(self, args):
-        """Remove tasks."""
-        self.logger.info("=> [info] remove tasks...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "remove_tasks",
-            "kwargs": {
-                "identities": args.identities,
-            },
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
-        rich.print(msg)
-
-    gtibi_parser = cmd2.Cmd2ArgumentParser()
-    gtibi_parser.add_argument("--identities", type=str, nargs="+", default=[], help="task id")
-    @cmd2.with_argparser(gtibi_parser)
-    def do_get_task_info_by_identities(self, args):
-        """Get task info by identities."""
-        self.logger.info("=> [info] Get task info by identities...")
-        self.client.send_binary(common_utils.dict_to_byte_msg({
-            "function": "get_task_info_by_identities",
-            "kwargs": {
-                "identities": args.identities,
-            },
-        }))
-        msg = common_utils.byte_msg_to_dict(self.client.recv_binary()[0])
+    gts_parser = cmd2.Cmd2ArgumentParser()
+    gts_parser.add_argument("--task_ids", type=str, nargs="+")
+    @cmd2.with_argparser(gts_parser)
+    def do_get_task_info(self, args):
+        """Get task info."""
+        msg = self.client.send(
+            service_name="/api/task/get_task_info".encode(),
+            request=[
+                json.dumps({
+                    "task_ids": args.task_ids
+                }).encode()
+            ]
+        )
+        msg = json.loads(msg[0])
         rich.print(msg)

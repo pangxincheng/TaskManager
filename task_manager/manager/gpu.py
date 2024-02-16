@@ -1,297 +1,570 @@
-import time
 import math
+import time
 import threading
-import multiprocessing as mp
-from typing import Dict, Any
 
 import zmq
-import pycuda.driver as pycuda_drv
+import json
+import pynvml
+pynvml.nvmlInit()
+import pycuda.driver as cuda_drv
+cuda_drv.init()
 from pycuda.tools import clear_context_caches
 
-import task_manager.utils.zmq_utils as zmq_utils
-import task_manager.utils.common_utils as common_utils
+import task_manager.core.const as const
+import task_manager.manager.utils as utils
+from task_manager.core.base import BaseNode
 
-class GPUManager(mp.Process):
+class WatchDogManager:
+
+    def __init__(self, chunk_size: int, unit: int) -> None:
+        self.chunk_size = utils.to_bytes(chunk_size, unit)
+        self._gpus = {}
+        self.requests = []
+
+    def __contains__(self, device_id: int) -> bool:
+        return device_id in self._gpus
+    
+    def get_watchdog_info(self, device_id: int) -> dict:
+        if device_id in self._gpus:
+            gpu = self._gpus[device_id]
+            return {
+                "status": 200,
+                "msg": "success",
+                "chunks": [chunk[1] for chunk in gpu["chunks"]],
+            }
+        else:
+            return {
+                "status": 400,
+                "msg": "not found",
+            }
+
+    def add_watchdog(self, device_id: int) -> bool:
+        try:
+            device = cuda_drv.Device(device_id)
+            context = device.make_context()
+            self._gpus[device_id] = {
+                "device": device,
+                "context": context,
+                "nvml_handle": pynvml.nvmlDeviceGetHandleByIndex(device_id),
+                "chunks": [],
+            }
+            return True
+        except Exception as e:
+            return False
+    
+    def remove_watchdog(self, device_id: int) -> bool:
+        try:
+            if device_id in self._gpus:
+                gpu = self._gpus.pop(device_id)
+                gpu["context"].detach()
+                del gpu
+                clear_context_caches()
+                return True
+            else:
+                return False
+        except Exception as e:
+            return False
+        
+    def allocate_memory(self, device_id: int, mem_size: int):
+        try:
+            if device_id in self._gpus:
+                gpu = self._gpus[device_id]
+                total_size = sum([chunk[1] for chunk in gpu["chunks"]])
+                if mem_size > total_size:
+                    return False
+                gpu["context"].push()
+                while mem_size > 0:
+                    chunk = gpu["chunks"].pop()
+                    mem_size -= chunk[1]
+                    chunk[0].free()
+                    del chunk
+                return True
+            else:
+                return False
+        except Exception as e:
+            return False
+
+    def preempt_memory(self, device_id: int, mem_size: int):
+        try:
+            if device_id in self._gpus:
+                gpu = self._gpus[device_id]
+                nvml_handle = gpu["nvml_handle"]
+                total_memory: int = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle).total
+                if mem_size > total_memory:
+                    return 0
+                else:
+                    num_chunks: int = math.ceil(mem_size / self.chunk_size)
+                    new_size: int = 0
+                    gpu["context"].push()
+                    try:
+                        for _ in range(num_chunks):
+                            new_chunk = cuda_drv.mem_alloc(self.chunk_size)
+                            new_size += self.chunk_size
+                            gpu["chunks"].append([new_chunk, self.chunk_size])
+                    except Exception as e:
+                        print(e)
+                    finally:
+                        cuda_drv.Context.pop()
+                    return new_size
+            else:
+                return 0
+        except Exception as e:
+            print(e)
+            return 0
+
+    def auto_preempt_memory(self, device_id: int, mem_size: int):
+        self.requests.append({
+            "device_id": device_id,
+            "mem_size": mem_size,
+        })
+        return True
+
+    def run(self):
+        for request in self.requests:
+            device_id = request["device_id"]
+            mem_size = request["mem_size"]
+            request["mem_size"] -= self.preempt_memory(device_id, mem_size)
+
+        for idx in range(len(self.requests) - 1, -1, -1):
+            if self.requests[idx]["mem_size"] <= 0:
+                del self.requests[idx]
+
+functions = {}
+def register(func):
+    functions[func.__name__] = func
+    return func
+
+class GPUManager(BaseNode):
+    TYPE_LOGGER = b"logger"
 
     def __init__(
         self,
-        identity: str,
-        device_id: int,
-        gpu_manager_addr: str
+        node_name: str,
+        broker_addr: str,
+        internal_addr: str,
+        logger_addr: str,
+        heartbeat_liveness: int = 5,
+        heartbeat_interval: int = 2500,
+        unit: str = "MiB",
+        chunk_size: int = 512,
+        ctx: zmq.Context = None,
     ) -> None:
-        mp.Process.__init__(self, daemon=True)
-        assert gpu_manager_addr.startswith("tcp://") or gpu_manager_addr.startswith("ipc://"), \
-            "gpu manager address must start with tcp:// or ipc://"
-        self.identity = identity
-        self.device_id = device_id
-        self.gpu_manager_addr = gpu_manager_addr
+        super().__init__(node_name, logger_addr, ctx)
+        self.service_name = node_name
+        self.broker_addr = broker_addr
+        self.internal_addr = internal_addr
+        self.heartbeat_liveness = heartbeat_liveness
+        self.heartbeat_interval = heartbeat_interval
+        self.unit = unit
+        self.chunk_size = chunk_size
 
-        self.device = None
-        self.ctx = None
+        self.dealer: zmq.Socket = None
+        self.poller: zmq.Poller = zmq.Poller()
 
-        self.gpu_client = None
-
-        self.preemptive_condition = None
-        self.lock_for_chunks = None
-        self.zmq_context = None
-        self.worker_thread = None
-        self.preemptive_thread = None
-        self.router_client = None
-        
-        self.inter_addr = f"inproc://gpu{self.device_id}_inter_server"
-
-        self.chunks = []
-        self.chunk_size = None
-        self.auto_preemptive = False
-        self.preemptive_interval = 5
+        self.watchdogs = WatchDogManager(chunk_size, unit)
 
     def __del__(self):
-        if self.ctx is not None:
-            try:
-                self.ctx.pop()
-            except Exception as e:
-                pass
-        clear_context_caches()
+        self.destroy()
 
-    def worker_fn(self):
-        assert self.zmq_context is not None, "zmq context is not initialized"
-        
-        # init pycuda
-        pycuda_drv.init()
-        assert self.device_id < pycuda_drv.Device.count(), "Invalid device ID"
-        self.device = pycuda_drv.Device(self.device_id)
-        self.ctx = self.device.make_context()
-        device_local_var = self.device
-        ctx_local_var = self.ctx
-
-        inter_server = zmq_utils.ZMQServer(
-            addr=self.inter_addr,
-            context=self.zmq_context,
-        )
-        while self.running:
-            identity, msg = inter_server.recv_binary()
-            identity = identity.decode("utf-8")
-            command = common_utils.byte_msg_to_dict(msg)
-            return_msg = self.exception_wrapper(
-                fn=getattr(self, command["function"], self._default_fn),
-                *command.get("args", {}),
-                **command.get("kwargs", {})
-            )
-            inter_server.send_binary(
-                any=common_utils.dict_to_byte_msg(return_msg),
-                identity=identity,
-            )
-
-        try:
-            ctx_local_var.pop()
-            ctx_local_var = None
-            device_local_var = None
-            clear_context_caches()
-        except Exception as e:
-            pass
-
-    def preemptive_fn(self):
-        assert self.zmq_context is not None, "zmq context is not initialized"
-        preemptive_client = zmq_utils.ZMQClient(
-            addr=self.inter_addr,
-            identity=f"gpu{self.device_id}_preemptive_client",
-            context=self.zmq_context,
-        )
-        while self.running:
-            with self.preemptive_condition:
-                if not self.auto_preemptive:
-                    self.preemptive_condition.wait()
-            if self.auto_preemptive:
-                preemptive_client.send_binary(
-                    any=common_utils.dict_to_byte_msg({
-                        "function": "get_free_memory"
-                    })
-                )
-                msg = common_utils.byte_msg_to_dict(preemptive_client.recv_binary()[0])
-                if msg["status"] == 200:
-                    free_bytes = msg["result"]
-                    while free_bytes > self.chunk_size:
-                        chunks_len = -1
-                        with self.lock_for_chunks:
-                            chunks_len = len(self.chunks)
-                        assert chunks_len >= 0 and self.chunk_size >= 0 and self.max_size >= 0, "Invalid chunks"
-                        if (chunks_len + 1) * self.chunk_size >= self.max_size:
-                            # if the total size of chunks is larger than max_size, we will not allocate more chunks
-                            # and we will increase the sleep time 
-                            time.sleep(self.preemptive_interval * 4)
-                            if self.preemptive_auto_close:
-                                self.auto_preemptive = False
-                            break
-                        try:
-                            preemptive_client.send_binary(
-                                any=common_utils.dict_to_byte_msg({
-                                    "function": "mem_alloc",
-                                    "kwargs": {
-                                        "chunk_size": self.chunk_size,
-                                        "max_size": self.chunk_size,
-                                        "unit": "B"
-                                    }
-                                }),
-                            )
-                            return_msg = common_utils.byte_msg_to_dict(preemptive_client.recv_binary()[0])
-                            if return_msg["status"] == 200:
-                                time.sleep(self.preemptive_interval)
-                            else:
-                                time.sleep(self.preemptive_interval * 4)
-                        except Exception as e:
-                            time.sleep(self.preemptive_interval * 4)
-                else:
-                    time.sleep(self.preemptive_interval * 4)
-
-    def _init_manager(self):
-        self.running = True
-
-        self.gpu_client = zmq_utils.ZMQClient(self.gpu_manager_addr, self.identity)
-
-        self.preemptive_condition = threading.Condition()
-        self.preemptive_auto_close = False
-        self.lock_for_chunks = threading.Lock()
-        self.zmq_context = zmq.Context()
-        self.worker_thread = threading.Thread(target=self.worker_fn, daemon=True)
-        self.preemptive_thread = threading.Thread(target=self.preemptive_fn, daemon=True)
-        self.worker_thread.start()
-        self.preemptive_thread.start()
-        self.router_client = zmq_utils.ZMQClient(
-            addr=self.inter_addr,
-            identity=f"gpu{self.device_id}_router_client",
-            context=self.zmq_context,
-        )
-        time.sleep(1)
-        self.gpu_client.send_binary(common_utils.dict_to_byte_msg({
-            "status": 200,
-            "result": f"Success start a watching dog🐶 on GPU{self.device_id}"
-        }))
+    def destroy(self):
+        if self.dealer:
+            self.poller.unregister(self.dealer)
+            self.dealer.close()
+            self.dealer = None
+        super().destroy()
 
     def run(self):
-        self._init_manager()
-        while self.running:
-            self.router_client.send_binary(self.gpu_client.recv_binary()[0])
-            self.gpu_client.send_binary(self.router_client.recv_binary()[0])
-    
-    def exception_wrapper(self, fn, *args, **kwargs) -> Dict[str, Any]:
+
+        worker_thread = threading.Thread(target=self._worker_thread)
+        worker_thread.start()
+
+        # worker thread
+        pair: zmq.Socket = self.ctx.socket(zmq.PAIR)
+        pair.linger = 1
+        pair.connect(self.internal_addr)
+        self.poller.register(pair, zmq.POLLIN)
+        if not self._test_pair(pair):
+            self.logger("Pair is not connected, exiting...", level="error")
+            return
+        self._reconnect_to_broker()
+        liveness = self.heartbeat_liveness
+        heartbeat_at = 0.0
+        
+        while self._test_worker_alive(worker_thread):
+            try:
+                events = dict(self.poller.poll(self.heartbeat_interval))
+            except KeyboardInterrupt:
+                self.logger("Interrupted caused by KeyboardInterrupt, exiting...", level="error")
+                break
+
+            if self.dealer in events:
+                liveness = self.heartbeat_liveness
+                empty, msg_type, *others = self.dealer.recv_multipart()
+                assert empty == const.EMPTY, "Empty delimiter must be const.EMPTY"
+                if msg_type == const.HEARTBEAT:
+                    liveness = self.heartbeat_liveness
+                elif msg_type == const.CALL:
+                    pair.send_multipart([empty, msg_type, *others])
+                elif msg_type == const.DISCONNECT:
+                    self._reconnect_to_broker()
+                else:
+                    self.logger(["received unknown message type", msg_type], level="error")
+            else:
+                liveness -= 1
+                if liveness == 0:
+                    self.logger(["lost connection to broker, retrying to connect to the broker..."])
+                    self._reconnect_to_broker()
+                    liveness = self.heartbeat_liveness
+            
+            if pair in events:
+                empty, msg_type, *others = pair.recv_multipart()
+                if msg_type == const.HEARTBEAT:
+                    pass  # ignore the heartbeat message
+                elif msg_type == GPUManager.TYPE_LOGGER:
+                    level = others[0].decode()
+                    others = others[1:]
+                    self.logger(others, level=level)
+                else:
+                    self.dealer.send_multipart([empty, msg_type, *others])
+
+            if time.time() > heartbeat_at:
+                self.dealer.send_multipart([
+                    const.EMPTY, 
+                    const.HEARTBEAT
+                ])
+                heartbeat_at = time.time() + self.heartbeat_interval * 1e-3
+
+    def _reconnect_to_broker(self):
+        if self.dealer:
+            self.poller.unregister(self.dealer)
+            self.dealer.close()
+            self.dealer = None
+            self.logger(["Service name =", self.service_name, f"reconnect to {self.broker_addr}"])
+        else:
+            self.logger(["Service name =", self.service_name, f"connect to {self.broker_addr}"])
+        self.dealer: zmq.Socket = self.ctx.socket(zmq.DEALER)
+        self.dealer.linger = 1
+        self.dealer.connect(self.broker_addr)
+        self.poller.register(self.dealer, zmq.POLLIN)
+        time.sleep(0.1)  # wait for connection to establish
+        self.dealer.send_multipart([
+            const.EMPTY,
+            const.REGISTER,
+            self.service_name.encode(),
+        ])
+
+    def _default_fn(self, *requests: list[bytes]) -> list[bytes]:
+        return [
+            json.dumps({
+                "status": 200,
+                "msg": "success",
+                "data": sorted(list(functions.keys())),
+            }).encode()
+        ]
+
+    def _test_pair(self, pair: zmq.Socket) -> bool:
+        """Test if the pair is connected."""
+        while True:
+            pair.send_multipart([const.EMPTY, const.HEARTBEAT])
+            try:
+                events = dict(self.poller.poll(self.heartbeat_interval))
+            except KeyboardInterrupt:
+                self.logger("Interrupted caused by KeyboardInterrupt, exiting...", level="error")
+                return False
+            if pair in events:
+                return True
+
+    def _test_worker_alive(self, worker_thread: threading.Thread) -> bool:
+        """Test if the worker thread is alive."""
+        if worker_thread.is_alive():
+            return True
+        else:
+            self.logger("Worker thread is not alive, exiting...", level="error")
+            return False
+
+    def _worker_thread(self):
+        pynvml.nvmlInit()
+
+        pair: zmq.Socket = self.ctx.socket(zmq.PAIR)
+        pair.linger = 1
+        pair.bind(self.internal_addr)
+        time.sleep(0.1)  # wait for connection to establish
+
+        poller: zmq.Poller = zmq.Poller()
+        poller.register(pair, zmq.POLLIN)
+
+        while True:
+            try:
+                events = dict(poller.poll(self.heartbeat_interval))
+            except KeyboardInterrupt:
+                self.logger("Interrupted caused by KeyboardInterrupt, exiting...", level="error")
+                break
+
+            if pair in events:
+                empty, msg_type, *others = pair.recv_multipart()
+                if msg_type == const.HEARTBEAT:
+                    pair.send_multipart([const.EMPTY, const.HEARTBEAT])
+                elif msg_type == const.CALL:
+                    router_chain_len = int.from_bytes(others[0], "big") if others[0] != const.EMPTY else 0
+                    router_chain = others[1:router_chain_len+1]
+                    others = others[router_chain_len+1:]
+                    service_name: str = others[0].decode()
+                    if service_name.startswith(const.SERVICE_SPLIT):
+                        service_name: str = service_name[len(const.SERVICE_SPLIT):]
+                    service_name: list[str] = service_name.split(const.SERVICE_SPLIT)
+                    if service_name[0] != self.service_name:
+                        pair.send_multipart([
+                            const.EMPTY,
+                            const.REPLY,
+                            router_chain_len.to_bytes(1, "big"),
+                            *router_chain,
+                            const.SERVICE_NOT_FOUND,
+                        ])
+                    else:
+                        if len(service_name) == 1:
+                            fn = self._default_fn
+                        else:
+                            fn = functions.get(service_name[1], self._default_fn)
+                        pair.send_multipart([
+                            const.EMPTY, 
+                            const.REPLY,
+                            router_chain_len.to_bytes(1, "big") if router_chain_len > 0 else const.EMPTY,
+                            *router_chain,
+                            *self._exception_wrapper(
+                                fn,
+                                self,
+                                *others[1:],
+                            ),
+                        ])
+
+            self.watchdogs.run()
+
+    def _exception_wrapper(self, fn, *requests: list[bytes]) -> list[bytes]:
         try:
-            return fn(*args, **kwargs)
+            return fn(*requests)
         except Exception as e:
-            return {
+            return [json.dumps({
                 "status": 400,
-                "result": f"Exception when call {fn.__name__}, the excption is " + str(e)
-            }
+                "msg": f"Exception when call {fn.__name__}, the excption is " + str(e)
+            }).encode()]
 
-    def _default_fn(self, *args, **kwargs):
-        raise NotImplementedError("This function is not implemented")
+    @register
+    def get_gpu_info(self, *requests: list[bytes]) -> list[bytes]:
+        requests = json.loads(requests[0])
+        device_ids = requests.get("device_ids", list(range(pynvml.nvmlDeviceGetCount())))
+        assert len(device_ids) == len(set(device_ids)), "device_ids should not contain duplicate elements"
+        assert all([isinstance(device_id, int) for device_id in device_ids]), "device_ids should be a list of integers"
+        assert all([device_id >= 0 and device_id < pynvml.nvmlDeviceGetCount() for device_id in device_ids]), "device_ids should be in the valid range"
 
-    def exit(self):
-        self.running = False
-        return {
-            "status": 200,
-            "result": "👋bye~"
-        }
+        return_msg = []
+        for device_id in device_ids:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+            return_msg.append({
+                "device_id": device_id,
+                "name": pynvml.nvmlDeviceGetName(handle),
+                "total_memory": utils.fmt_size(pynvml.nvmlDeviceGetMemoryInfo(handle).total),
+                "free_memory": utils.fmt_size(pynvml.nvmlDeviceGetMemoryInfo(handle).free),
+                "used_memory": utils.fmt_size(pynvml.nvmlDeviceGetMemoryInfo(handle).used),
+                "temperature": pynvml.nvmlDeviceGetTemperature(handle, 0),
+                "power": pynvml.nvmlDeviceGetPowerUsage(handle) / 1000,
+                "watchdog": self.watchdogs.get_watchdog_info(device_id),
+            })
+        return [
+            json.dumps({
+                "status": 200,
+                "msg": "success",
+                "data": return_msg,
+            }).encode()
+        ]
+    
+    @register
+    def add_watchdog(self, *requests: list[bytes]) -> list[bytes]:
+        requests = json.loads(requests[0])
+        device_ids: list[int] = requests.get("device_ids", None)
+        assert device_ids is not None, "device_ids should not be None"
+        assert len(device_ids) == len(set(device_ids)), "device_ids should not contain duplicate elements"
+        assert all([isinstance(device_id, int) for device_id in device_ids]), "device_ids should be a list of integers"
+        assert all([device_id >= 0 and device_id < pynvml.nvmlDeviceGetCount() for device_id in device_ids]), "device_ids should be in the valid range"
+        assert all([device_id not in self.watchdogs for device_id in device_ids]), "device_ids should not contain duplicate elements"
+        
+        return_msg = []
+        for device_id in device_ids:
+            if self.watchdogs.add_watchdog(device_id):
+                return_msg.append({
+                    "device_id": device_id,
+                    "status": 200,
+                    "msg": "success",
+                })
+            else:
+                return_msg.append({
+                    "device_id": device_id,
+                    "status": 400,
+                    "msg": "failed",
+                })
+        
+        return [
+            json.dumps({
+                "status": 200,
+                "msg": "success",
+                "data": return_msg,
+            }).encode()
+        ]
+    
+    @register
+    def remove_watchdog(self, *requests: list[bytes]) -> list[bytes]:
+        requests = json.loads(requests[0])
+        device_ids: list[int] = requests.get("device_ids", None)
+        assert device_ids is not None, "device_ids should not be None"
+        assert len(device_ids) == len(set(device_ids)), "device_ids should not contain duplicate elements"
+        assert all([isinstance(device_id, int) for device_id in device_ids]), "device_ids should be a list of integers"
+        assert all([device_id >= 0 and device_id < pynvml.nvmlDeviceGetCount() for device_id in device_ids]), "device_ids should be in the valid range"
+        assert all([device_id in self.watchdogs for device_id in device_ids]), "device_ids should not contain duplicate elements"
+        
+        return_msg = []
+        for device_id in device_ids:
+            if self.watchdogs.remove_watchdog(device_id):
+                return_msg.append({
+                    "device_id": device_id,
+                    "status": 200,
+                    "msg": "success",
+                })
+            else:
+                return_msg.append({
+                    "device_id": device_id,
+                    "status": 400,
+                    "msg": "failed",
+                })
+        
+        return [
+            json.dumps({
+                "status": 200,
+                "msg": "success",
+                "data": return_msg,
+            }).encode()
+        ]
 
-    def get_gpu_info(self, info_level: str="simple") -> Dict[str, Any]:
-        free_bytes, total_bytes = pycuda_drv.mem_get_info()
-        device_msg = {
-            "device_id": self.device_id,
-            "device_name": self.device.name(),
-            "total_memory": common_utils.fmt_bytes(total_bytes),
-            "free_memory": common_utils.fmt_bytes(free_bytes),
-            "compute_capability": float("%d.%d" % self.device.compute_capability()),
-            "chunk_size": "none",
-            "n_chunks": -1
-        }
-        if self.chunk_size is not None:
-            device_msg["chunk_size"] = common_utils.fmt_bytes(self.chunk_size)
-            device_msg["n_chunks"] = len(self.chunks)
-        if info_level != "simple":
-            device_attributes_tuples = self.device.get_attributes().items()
-            device_attributes = {}
+    @register    
+    def allocate_memory(self, *requests: list[bytes]) -> list[bytes]:
+        requests = json.loads(requests[0])
+        device_ids: list[int] = requests.get("device_ids", None)
+        mem_sizes: list[int] = requests.get("mem_sizes", None)
+        units: list[str] = requests.get("units", None)
+        assert device_ids is not None, "device_ids should not be None"
+        assert mem_sizes is not None, "mem_sizes should not be None"
+        assert units is not None, "units should not be None"
+        assert len(device_ids) == len(mem_sizes) and len(device_ids) == len(units), "device_ids and mem_sizes should have the same length"
+        assert len(device_ids) == len(set(device_ids)), "device_ids should not contain duplicate elements"
+        assert all([isinstance(device_id, int) for device_id in device_ids]), "device_ids should be a list of integers"
+        assert all([device_id >= 0 and device_id < pynvml.nvmlDeviceGetCount() for device_id in device_ids]), "device_ids should be in the valid range"
+        assert all([device_id in self.watchdogs for device_id in device_ids]), "device_ids should not contain duplicate elements"
+        assert all([isinstance(mem_size, int) for mem_size in mem_sizes]), "mem_sizes should be a list of integers"
+        assert all([unit in ["B", "KiB", "MiB", "GiB"] for unit in units]), "units should be a list of strings in ['B', 'KiB', 'MiB', 'GiB']"
 
-            for k, v in device_attributes_tuples:
-                device_attributes[str(k)] = v
-            device_msg["device_attributes"] = device_attributes
-        return {
-            "status": 200,
-            "result": device_msg
-        }
+        return_msg = []
+        for device_id, mem_size, unit in zip(device_ids, mem_sizes, units):
+            mem_size = utils.to_bytes(mem_size, unit)
+            if self.watchdogs.allocate_memory(device_id, mem_size):
+                return_msg.append({
+                    "device_id": device_id,
+                    "status": 200,
+                    "msg": "success",
+                })
+            else:
+                return_msg.append({
+                    "device_id": device_id,
+                    "status": 400,
+                    "msg": "failed",
+                })
+        
+        return [
+            json.dumps({
+                "status": 200,
+                "msg": "success",
+                "data": return_msg,
+            }).encode()
+        ]
+    
+    @register
+    def preempt_memory(self, *requests: list[bytes]) -> list[bytes]:
+        requests = json.loads(requests[0])
+        device_ids: list[int] = requests.get("device_ids", None)
+        mem_sizes: list[int] = requests.get("mem_sizes", None)
+        units: list[str] = requests.get("units", None)
+        assert device_ids is not None, "device_ids should not be None"
+        assert mem_sizes is not None, "mem_sizes should not be None"
+        assert units is not None, "units should not be None"
+        assert len(device_ids) == len(mem_sizes) and len(device_ids) == len(units), "device_ids and mem_sizes should have the same length"
+        assert len(device_ids) == len(set(device_ids)), "device_ids should not contain duplicate elements"
+        assert all([isinstance(device_id, int) for device_id in device_ids]), "device_ids should be a list of integers"
+        assert all([device_id >= 0 and device_id < pynvml.nvmlDeviceGetCount() for device_id in device_ids]), "device_ids should be in the valid range"
+        assert all([device_id in self.watchdogs for device_id in device_ids]), "device_ids should not contain duplicate elements"
+        assert all([isinstance(mem_size, int) for mem_size in mem_sizes]), "mem_sizes should be a list of integers"
+        assert all([unit in ["B", "KiB", "MiB", "GiB"] for unit in units]), "units should be a list of strings in ['B', 'KiB', 'MiB', 'GiB']"
 
-    def get_free_memory(self) -> Dict[str, Any]:
-        free_bytes, _ = pycuda_drv.mem_get_info()
-        return {
-            "status": 200,
-            "result": free_bytes
-        }
+        return_msg = []
+        for device_id, mem_size, unit in zip(device_ids, mem_sizes, units):
+            mem_size = utils.to_bytes(mem_size, unit)
+            if self.watchdogs.preempt_memory(device_id, mem_size) >= mem_size:
+                return_msg.append({
+                    "device_id": device_id,
+                    "status": 200,
+                    "msg": "success",
+                })
+            else:
+                return_msg.append({
+                    "device_id": device_id,
+                    "status": 400,
+                    "msg": "failed",
+                })
+        
+        return [
+            json.dumps({
+                "status": 200,
+                "msg": "success",
+                "data": return_msg,
+            }).encode()
+        ]
+    
+    @register
+    def auto_preempt_memory(self, *requests: list[bytes]) -> list[bytes]:
+        requests = json.loads(requests[0])
+        device_ids: list[int] = requests.get("device_ids", None)
+        mem_sizes: list[int] = requests.get("mem_sizes", None)
+        units: list[str] = requests.get("units", None)
+        assert device_ids is not None, "device_ids should not be None"
+        assert mem_sizes is not None, "mem_sizes should not be None"
+        assert units is not None, "units should not be None"
+        assert len(device_ids) == len(mem_sizes) and len(device_ids) == len(units), "device_ids and mem_sizes should have the same length"
+        assert len(device_ids) == len(set(device_ids)), "device_ids should not contain duplicate elements"
+        assert all([isinstance(device_id, int) for device_id in device_ids]), "device_ids should be a list of integers"
+        assert all([device_id >= 0 and device_id < pynvml.nvmlDeviceGetCount() for device_id in device_ids]), "device_ids should be in the valid range"
+        assert all([device_id in self.watchdogs for device_id in device_ids]), "device_ids should not contain duplicate elements"
+        assert all([isinstance(mem_size, int) for mem_size in mem_sizes]), "mem_sizes should be a list of integers"
+        assert all([unit in ["B", "KiB", "MiB", "GiB"] for unit in units]), "units should be a list of strings in ['B', 'KiB', 'MiB', 'GiB']"
 
-    def mem_alloc(self, chunk_size: int, max_size: int, unit: str="MiB") -> Dict[str, Any]:
-        assert chunk_size > 0, "chunk size must be positive"
-        assert max_size > 0, "max size must be positive"
-        assert unit in ["B", "KiB", "MiB", "GiB"], "unit must be one of [B, KiB, MiB, GiB]"
-        chunk_size = common_utils.to_bytes(chunk_size, unit)
-        max_size = common_utils.to_bytes(max_size, unit)
-        if self.chunk_size is not None:
-            assert self.chunk_size == chunk_size, "currently the chunk size must be the same"
-        free_bytes, _ = pycuda_drv.mem_get_info()
-        assert chunk_size <= max_size, "chunk size must be smaller than max size"
-        assert chunk_size <= free_bytes, "chunk size must be smaller than free memory"
-        assert max_size <= free_bytes, "max size must be smaller than free memory"
-        n_chunks = min(max_size // chunk_size, free_bytes // chunk_size)
-        with self.lock_for_chunks:
-            self.chunks += [pycuda_drv.mem_alloc(chunk_size) for _ in range(n_chunks)]
-        self.chunk_size = chunk_size
-        return {
-            "status": 200,
-            "result": f"Success allocate {common_utils.fmt_bytes(n_chunks * chunk_size)} memory"
-        }
-
-    def mem_release(self, mem_size: int, unit: str="MiB") -> Dict[str, Any]:
-        assert mem_size > 0, "memory size must be positive"
-        assert unit in ["B", "KiB", "MiB", "GiB"], "unit must be one of [B, KiB, MiB, GiB]"
-        if self.chunk_size is None:
-            raise Exception("mem_alloc() must be called before mem_release")
-        mem_size = common_utils.to_bytes(mem_size, unit)
-        if mem_size > self.chunk_size * len(self.chunks):
-            raise Exception(f"memory size {common_utils.fmt_bytes(mem_size)} is too large")
-        n_chunks = math.ceil(mem_size / self.chunk_size)
-        with self.lock_for_chunks:
-            self.chunks = self.chunks[n_chunks:]
-        clear_context_caches()
-        return {
-            "status": 200,
-            "result": f"Success release {common_utils.fmt_bytes(n_chunks * self.chunk_size)} memory"
-        }
-
-    def start_preemptive(self, chunk_size: int, max_size: int, unit: str="MiB", auto_close: bool=False):
-        assert chunk_size > 0, "chunk size must be positive"
-        assert max_size > 0, "max size must be positive"
-        assert unit in ["B", "KiB", "MiB", "GiB"], "unit must be one of [B, KiB, MiB, GiB]"
-        chunk_size = common_utils.to_bytes(chunk_size, unit)
-        max_size = common_utils.to_bytes(max_size, unit)
-        if self.chunk_size is not None:
-            assert self.chunk_size == chunk_size, "currently the chunk size must be the same"
-        self.chunk_size = chunk_size
-        self.max_size = max_size
-        if self.auto_preemptive:
-            return {
-                "status": 400,
-                "result": "Already in preemptive mode, Please call stop_preemptive() first"
-            }
-        with self.preemptive_condition:
-            self.auto_preemptive = True
-            self.preemptive_auto_close = auto_close
-            self.preemptive_condition.notify_all()
-        return {
-            "status": 200,
-            "result": "Success start preemptive"
-        }
-
-    def stop_preemptive(self):
-        with self.preemptive_condition:
-            self.auto_preemptive = False
-            self.preemptive_condition.notify_all()
-        return {
-            "status": 200,
-            "result": "Success stop preemptive"
-        }
+        return_msg = []
+        for device_id, mem_size, unit in zip(device_ids, mem_sizes, units):
+            mem_size = utils.to_bytes(mem_size, unit)
+            if self.watchdogs.auto_preempt_memory(
+                device_id=device_id, 
+                mem_size=mem_size,
+            ):
+                return_msg.append({
+                    "device_id": device_id,
+                    "status": 200,
+                    "msg": "success",
+                })
+            else:
+                return_msg.append({
+                    "device_id": device_id,
+                    "status": 400,
+                    "msg": "failed",
+                })
+        
+        return [
+            json.dumps({
+                "status": 200,
+                "msg": "success",
+                "data": return_msg,
+            }).encode()
+        ]

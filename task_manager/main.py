@@ -1,82 +1,123 @@
-import os
-import sys
-import rich
-import time
 import argparse
 import multiprocessing as mp
 
-if mp.get_start_method(allow_none=True) is None:
-    mp.set_start_method("spawn")
-else:
-    assert mp.get_start_method() == "spawn", "Only support spawn start method"
+from task_manager.core.logger import LoggerNode
+from task_manager.core.broker import BrokerNode
+from task_manager.manager.gpu import GPUManager
+from task_manager.manager.task import TaskManager
+from task_manager.controller.cli_controller import CliController
 
-import task_manager.utils.common_utils as common_utils
-from task_manager.manager.core import CoreManager
-from task_manager.controller.cli_controller import CLIController
+# logger
+logger_node_name = "logger"
+logger_addr = "tcp://127.0.0.1:5555"
 
-def parse_args():
-    identity_id = common_utils.md5(str(time.time()))
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--log_dir", default="logs", help="Log dir")
-    parser.add_argument("--log_level", default="INFO", help="Log level")
-    parser.add_argument("--web_controller", action="store_true", help="Whether start web gui to watch GPU usage&Tasks")
-    parser.add_argument(
-        "--core_manager_addr", 
-        type=str, 
-        default=f"ipc:///tmp/core_manager-{identity_id}.sock", 
-        help="Address to run Core manager on"
-    )
-    parser.add_argument(
-        "--gpu_manager_addr",
-        type=str,
-        default=f"ipc:///tmp/gpu_manager-{identity_id}.sock",
-        help="Address to run GPU manager on"
-    )
-    parser.add_argument(
-        "--task_manager_addr",
-        type=str,
-        default=f"ipc:///tmp/task_manager-{identity_id}.sock",
-        help="Address to run Task manager on"
-    )
-    args = parser.parse_args()
-    os.makedirs(args.log_dir, exist_ok=True)
-    sys.argv = sys.argv[:1]
-    return args
+# broker
+broker_node_name = "api"
+broker_external_addr = "tcp://127.0.0.1:5556"
+broker_internal_addr = "inproc:///tmp/broker.sock"
 
-def start_core_manager(args):
-    core_manager = CoreManager(
-        core_manager_addr=args.core_manager_addr,
-        gpu_manager_addr=args.gpu_manager_addr,
-        task_manager_addr=args.task_manager_addr,
-        log_dir=args.log_dir,
-        log_level=args.log_level,
-    )
-    core_manager.start()
-    time.sleep(1)
-    return core_manager
+# gpu
+gpu_node_name = "localhost-gpu"
+gpu_internal_addr = "inproc:///tmp/gpu.sock"
 
-def start_cli_controller(args):
-    cli_controller = CLIController(
-        core_manager_addr=args.core_manager_addr,
-        log_dir=args.log_dir,
-        log_level=args.log_level,
+# task
+task_node_name = "task"
+task_external_addr = "tcp://127.0.0.1:5558"
+task_internal_addr = "inproc:///tmp/task.sock"
+
+def logger_fn(logger_node_name, logger_addr):
+    logger = LoggerNode(
+        node_name=logger_node_name,
+        logger_addr=logger_addr
+    )
+    logger.run()
+
+def broker_fn(broker_node_name, logger_addr, broker_external_addr, broker_internal_addr):
+    broker = BrokerNode(
+        node_name=broker_node_name, 
+        logger_addr=logger_addr,
+        external_addr=broker_external_addr,
+        internal_addr=broker_internal_addr,
+    )
+    broker.run()
+
+def gpu_fn(gpu_node_name, broker_external_addr, gpu_internal_addr, logger_addr):
+    gpu = GPUManager(
+        node_name=gpu_node_name,
+        broker_addr=broker_external_addr,
+        internal_addr=gpu_internal_addr,
+        logger_addr=logger_addr,
+    )
+    gpu.run()
+
+def task_fn(task_node_name, broker_external_addr, task_internal_addr, logger_addr):
+    task = TaskManager(
+        node_name=task_node_name,
+        broker_addr=broker_external_addr,
+        internal_addr=task_internal_addr,
+        logger_addr=logger_addr,
+    )
+    task.run()
+
+def cli_controller_fn(broker_addr, logger_addr):
+    cli_controller = CliController(
+        broker_addr=broker_external_addr,
+        logger_addr=logger_addr,
     )
     cli_controller.cmdloop()
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--type", type=str, choices=["client", "server"])
+    return parser.parse_args()
+
 def main():
     args = parse_args()
-    rich.print("🚀[bold green]Task Manager[/bold green]")
-    rich.print("[bold green]Args[/bold green]")
-    rich.print(vars(args))
-    rich.print("=> [bold green]\[INFO][/bold green] Start Core Manager...")
-    start_core_manager(args)
-
-    if args.web_controller:
-        rich.print("=> [bold green]\[INFO][/bold green] Start Web Controller...")
-        pass
-
-    rich.print("=> [bold green]\[INFO][/bold green] Start CLI Controller...")
-    start_cli_controller(args)
+    if args.type == "server":
+        logger_process = mp.Process(
+            target=logger_fn,
+            args=(
+                logger_node_name, 
+                logger_addr
+            )
+        )
+        broker_process = mp.Process(
+            target=broker_fn,
+            args=(
+                broker_node_name, 
+                logger_addr, 
+                broker_external_addr, 
+                broker_internal_addr
+            )
+        )
+        gpu_process = mp.Process(
+            target=gpu_fn,
+            args=(
+                gpu_node_name, 
+                broker_external_addr, 
+                gpu_internal_addr, 
+                logger_addr
+            )
+        )
+        task_process = mp.Process(
+            target=task_fn,
+            args=(
+                task_node_name, 
+                broker_external_addr, 
+                task_internal_addr, 
+                logger_addr
+            )
+        )
+        logger_process.start()
+        broker_process.start()
+        gpu_process.start()
+        task_process.start()
+        logger_process.join()
+        broker_process.join()
+        gpu_process.join()
+        task_process.join()
+    else:
+        cli_controller_fn(broker_external_addr, logger_addr)
 
 if __name__ == "__main__":
     main()

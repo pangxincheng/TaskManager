@@ -1,6 +1,8 @@
 cmd2==2.4.3
-pycuda==2023.1
+nvidia_ml_py==12.535.133
+psutil==5.9.8
+pycuda==2024.1
+pynvml==11.5.0
 pyzmq==25.1.2
 rich==13.7.0
-numpy>=1.21.4
 setuptools==68.2.2
