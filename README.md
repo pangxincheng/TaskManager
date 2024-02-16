@@ -35,4 +35,4 @@ This repository uses the following libraries:
 - [rich](https://github.com/Textualize/rich): A Python library for rich text and beautiful formatting in the terminal
 - [pycuda](https://github.com/inducer/pycuda): A library that lets you access Nvidia's CUDA parallel computation API from Python
 - [pyzmq](https://github.com/zeromq/pyzmq): Python bindings for ØMQ (a lightweight and fast messaging implementation)
-- [pynvml]
+- [pynvml](https://pypi.org/project/pynvml/): Provides a Python interface to GPU management and monitoring functions
