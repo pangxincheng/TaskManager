@@ -1,5 +1,7 @@
 import argparse
 import multiprocessing as mp
+if mp.get_start_method(allow_none=True) is None:
+    mp.set_start_method("spawn")
 
 from task_manager.core.logger import LoggerNode
 from task_manager.core.broker import BrokerNode

@@ -102,14 +102,14 @@ class WatchDogManager:
                             new_size += self.chunk_size
                             gpu["chunks"].append([new_chunk, self.chunk_size])
                     except Exception as e:
-                        print(e)
+                        pass
                     finally:
                         cuda_drv.Context.pop()
                     return new_size
             else:
                 return 0
         except Exception as e:
-            print(e)
+            pass
             return 0
 
     def auto_preempt_memory(self, device_id: int, mem_size: int):
