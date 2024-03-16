@@ -5,9 +5,9 @@ if mp.get_start_method(allow_none=True) is None:
 
 from task_manager.core.logger import LoggerNode
 from task_manager.core.broker import BrokerNode
-from task_manager.manager.gpu import GPUManager
-from task_manager.manager.task import TaskManager
-from task_manager.controller.cli_controller import CliController
+from task_manager.manager.gpu import create_worker as create_gpu_worker
+from task_manager.manager.task import create_worker as create_task_worker
+from task_manager.cli_controller import CliController
 
 # logger
 logger_node_name = "logger"
@@ -44,22 +44,30 @@ def broker_fn(broker_node_name, logger_addr, broker_external_addr, broker_intern
     broker.run()
 
 def gpu_fn(gpu_node_name, broker_external_addr, gpu_internal_addr, logger_addr):
-    gpu = GPUManager(
+    worker = create_gpu_worker(
+        unit="MiB",
+        chunk_size=512,
         node_name=gpu_node_name,
         broker_addr=broker_external_addr,
         internal_addr=gpu_internal_addr,
         logger_addr=logger_addr,
     )
-    gpu.run()
+    worker.run()
 
-def task_fn(task_node_name, broker_external_addr, task_internal_addr, logger_addr):
-    task = TaskManager(
+def task_fn(task_node_name, broker_external_addr, task_internal_addr, logger_addr, mysql_password):
+    worker = create_task_worker(
+        max_task_num=10,
+        mysql_host="localhost",
+        mysql_user="root",
+        mysql_password=mysql_password,
+        mysql_database="taskmanager",
+        mysql_charset="utf8",
         node_name=task_node_name,
         broker_addr=broker_external_addr,
         internal_addr=task_internal_addr,
         logger_addr=logger_addr,
     )
-    task.run()
+    worker.run()
 
 def cli_controller_fn(broker_addr, logger_addr):
     cli_controller = CliController(
@@ -71,6 +79,7 @@ def cli_controller_fn(broker_addr, logger_addr):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--type", type=str, choices=["client", "server"])
+    parser.add_argument("--mysql_password", type=str)
     return parser.parse_args()
 
 def main():
@@ -107,7 +116,8 @@ def main():
                 task_node_name, 
                 broker_external_addr, 
                 task_internal_addr, 
-                logger_addr
+                logger_addr,
+                args.mysql_password,
             )
         )
         logger_process.start()

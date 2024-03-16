@@ -1,9 +1,6 @@
-import os
 import cmd2
 import json
-import time
 import rich
-import signal
 import argparse
 
 from task_manager.core.client import Client
@@ -53,7 +50,7 @@ class CliController(cmd2.Cmd):
         return_msg = {}
         for node, device_ids in node_to_device_ids.items():
             msg = self.client.send(
-                service_name=f"/api/{node}/get_gpu_info".encode(),
+                service_name=f"/{node}/get_gpu_info".encode(),
                 request=[
                     json.dumps({
                         "device_ids": sorted(set(device_ids))
@@ -73,7 +70,7 @@ class CliController(cmd2.Cmd):
         return_msg = {}
         for node, device_ids in node_to_device_ids.items():
             msg = self.client.send(
-                service_name=f"/api/{node}/add_watchdog".encode(),
+                service_name=f"/{node}/add_watchdog".encode(),
                 request=[
                     json.dumps({
                         "device_ids": sorted(set(device_ids))
@@ -93,7 +90,7 @@ class CliController(cmd2.Cmd):
         return_msg = {}
         for node, device_ids in node_to_device_ids.items():
             msg = self.client.send(
-                service_name=f"/api/{node}/remove_watchdog".encode(),
+                service_name=f"/{node}/remove_watchdog".encode(),
                 request=[
                     json.dumps({
                         "device_ids": sorted(set(device_ids))
@@ -115,7 +112,7 @@ class CliController(cmd2.Cmd):
         return_msg = {}
         for node, device_ids in node_to_device_ids.items():
             msg = self.client.send(
-                service_name=f"/api/{node}/allocate_memory".encode(),
+                service_name=f"/{node}/allocate_memory".encode(),
                 request=[
                     json.dumps({
                         "device_ids": sorted(set(device_ids)),
@@ -139,7 +136,7 @@ class CliController(cmd2.Cmd):
         return_msg = {}
         for node, device_ids in node_to_device_ids.items():
             msg = self.client.send(
-                service_name=f"/api/{node}/preempt_memory".encode(),
+                service_name=f"/{node}/preempt_memory".encode(),
                 request=[
                     json.dumps({
                         "device_ids": sorted(set(device_ids)),
@@ -163,7 +160,7 @@ class CliController(cmd2.Cmd):
         return_msg = {}
         for node, device_ids in node_to_device_ids.items():
             msg = self.client.send(
-                service_name=f"/api/{node}/auto_preempt_memory".encode(),
+                service_name=f"/{node}/auto_preempt_memory".encode(),
                 request=[
                     json.dumps({
                         "device_ids": sorted(set(device_ids)),
@@ -179,17 +176,21 @@ class CliController(cmd2.Cmd):
     ct_parser = cmd2.Cmd2ArgumentParser()
     ct_parser.add_argument("--stdout", type=str, default=None)
     ct_parser.add_argument("--stderr", type=str, default=None)
+    ct_parser.add_argument('--task_name', type=str, required=True)
+    ct_parser.add_argument('--uid', type=int, required=True)
     ct_parser.add_argument('args', nargs=argparse.REMAINDER)
     @cmd2.with_argparser(ct_parser)
     def do_create_task(self, args):
         """Create task."""
         msg = self.client.send(
-            service_name="/api/task/create_task".encode(),
+            service_name="/task/create_task".encode(),
             request=[
                 json.dumps({
                     "stdout": args.stdout,
                     "stderr": args.stderr,
-                    "args": args.args
+                    "args": args.args,
+                    "task_name": args.task_name,
+                    "uid": args.uid,
                 }).encode()
             ]
         )
@@ -203,7 +204,7 @@ class CliController(cmd2.Cmd):
     def do_kill_task(self, args):
         """Kill task."""
         msg = self.client.send(
-            service_name="/api/task/kill_task".encode(),
+            service_name="/task/kill_task".encode(),
             request=[
                 json.dumps({
                     "task_ids": args.task_ids
@@ -219,7 +220,7 @@ class CliController(cmd2.Cmd):
     def do_get_task_info(self, args):
         """Get task info."""
         msg = self.client.send(
-            service_name="/api/task/get_task_info".encode(),
+            service_name="/task/get_task_info".encode(),
             request=[
                 json.dumps({
                     "task_ids": args.task_ids

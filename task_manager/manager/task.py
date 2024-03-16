@@ -1,368 +1,283 @@
 import json
 import time
+import enum
 import psutil
+import datetime
 import subprocess
-import threading
+from collections import OrderedDict
 
 import zmq
 
-import task_manager.core.const as const
-import task_manager.manager.utils as utils
-from task_manager.core.base import BaseNode
-
-functions = {}
-def register(func):
-    functions[func.__name__] = func
-    return func
+import pymysql
+import pymysql.cursors
+from task_manager.manager import utils
+from task_manager.core.worker import Worker, WorkerNode
 
 # Adapted from https://psutil.readthedocs.io/en/latest/#kill-process-tree
 def terminate_process_tree(pid):
-    process = psutil.Process(pid)
-    children = process.children(recursive=True)
-    children.append(process)
-    for child in children:
-        try:
-            child.terminate()
-        except psutil.NoSuchProcess:
-            pass
-    gone, alive = psutil.wait_procs(children, timeout=30)
-    for p in alive:
-        p.kill()
+    try:
+        process = psutil.Process(pid)
+        children = process.children(recursive=True)
+        children.append(process)
+        for child in children:
+            try:
+                child.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        gone, alive = psutil.wait_procs(children, timeout=30)
+        for p in alive:
+            p.kill()
+    except psutil.NoSuchProcess:
+        pass
 
-class WatchdogManager:
+class TaskWorker(Worker):
 
-    def __init__(self) -> None:
-        self._tasks = {}
-
-    def __del__(self):
-        for task_id in self._tasks:
-            if self._tasks[task_id]["status"] == "running":
-                self.kill_task(task_id)
-    
-    def create_task(self, task_id: str, args: list[str], stdout=None, stderr=None):
-        self._tasks[task_id] = {
-            "args": args,
-            "status": "running",
-            "start_time": time.time(),
-            "end_time": None,
-            "stdout": open(stdout, "w") if stdout else subprocess.PIPE,
-            "stderr": open(stderr, "w") if stderr else subprocess.PIPE,
-        }
-        task_handler = subprocess.Popen(
-            args=args, 
-            stdout=self._tasks[task_id]["stdout"], 
-            stderr=self._tasks[task_id]["stderr"], 
-        )
-        self._tasks[task_id]["handler"] = task_handler
-        self._tasks[task_id]["pid"] = task_handler.pid
-
-    def kill_task(self, task_id: str) -> str:
-        if task_id not in self._tasks:
-            return "not found"
-        terminate_process_tree(self._tasks[task_id]["handler"].pid)
-        if self._tasks[task_id]["stdout"] != subprocess.PIPE:
-            self._tasks[task_id]["stdout"].close()
-        if self._tasks[task_id]["stderr"] != subprocess.PIPE:
-            self._tasks[task_id]["stderr"].close()
-        self._tasks[task_id]["status"] = "killed"
-        self._tasks[task_id]["end_time"] = time.time()
-        return "killed"
-    
-    def get_task_info(self, task_id: str) -> str:
-        if task_id not in self._tasks:
-            return "not found"
-        return {
-            "args": self._tasks[task_id]["args"],
-            "status": self._tasks[task_id]["status"],
-            "start_time": self._tasks[task_id]["start_time"],
-            "end_time": self._tasks[task_id]["end_time"],
-            "pid": self._tasks[task_id]["pid"],
-        }
-    
-    def clear_tasks(self):
-        for task_id in list(self._tasks.keys()):
-            if self._tasks[task_id]["end_time"]:
-                self._tasks.pop(task_id)
-    
-    def run(self):
-        for task_id in self._tasks:
-            if self._tasks[task_id]["status"] == "running":
-                if self._tasks[task_id]["handler"].poll() is not None:
-                    self._tasks[task_id]["status"] = "finished"
-                    if self._tasks[task_id]["stdout"] != subprocess.PIPE:
-                        self._tasks[task_id]["stdout"].close()
-                    if self._tasks[task_id]["stderr"] != subprocess.PIPE:
-                        self._tasks[task_id]["stderr"].close()
-                    self._tasks[task_id]["end_time"] = time.time()
-
-        for task_id in list(self._tasks.keys()):
-            if self._tasks[task_id]["end_time"] and time.time() - self._tasks[task_id]["end_time"] > 3600:
-                self._tasks.pop(task_id)
-
-class TaskManager(BaseNode):
-    TYPE_LOGGER = b"logger"
+    class TASK_STATUS(enum.Enum):
+        waiting = 0
+        running = 1
+        killing = 3
+        finished = 4
 
     def __init__(
-        self, 
-        node_name: str, 
-        broker_addr: str,
-        internal_addr: str,
-        logger_addr: str, 
-        heartbeat_liveness: int = 5,
-        heartbeat_interval: int = 2500,
-        ctx: zmq.Context = None
+        self,
+        max_task_num: int,
+        mysql_host: str,
+        mysql_user: str,
+        mysql_password: str,
+        mysql_database: str,
+        mysql_charset: str = "utf8"
     ) -> None:
-        super().__init__(node_name, logger_addr, ctx)
-        self.service_name = node_name
-        self.broker_addr = broker_addr
-        self.internal_addr = internal_addr
-        self.heartbeat_liveness = heartbeat_liveness
-        self.heartbeat_interval = heartbeat_interval
-
-        self.dealer: zmq.Socket = None
-        self.poller: zmq.Poller = zmq.Poller()
-
-        self.watchdogs = WatchdogManager()
+        super().__init__()
+        self.max_task_num = max_task_num
+        self.sql_conn = pymysql.connect(
+            host=mysql_host,
+            user=mysql_user,
+            password=mysql_password,
+            database=mysql_database,
+            charset=mysql_charset,
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        self.cursor = self.sql_conn.cursor()
+        self._tasks = OrderedDict()
 
     def __del__(self):
-        self.destroy()
-
-    def destroy(self):
-        if self.dealer:
-            self.poller.unregister(self.dealer)
-            self.dealer.close()
-            self.dealer = None
-        super().destroy()
-    
-    def run(self):
-
-        worker_thread = threading.Thread(target=self._worker_thread)
-        worker_thread.start()
-
-        # worker thread
-        pair: zmq.Socket = self.ctx.socket(zmq.PAIR)
-        pair.linger = 1
-        pair.connect(self.internal_addr)
-        self.poller.register(pair, zmq.POLLIN)
-        if not self._test_pair(pair):
-            self.logger("Pair is not connected, exiting...", level="error")
-            return
-        self._reconnect_to_broker()
-        liveness = self.heartbeat_liveness
-        heartbeat_at = 0.0
-        
-        while self._test_worker_alive(worker_thread):
-            try:
-                events = dict(self.poller.poll(self.heartbeat_interval))
-            except KeyboardInterrupt:
-                self.logger("Interrupted caused by KeyboardInterrupt, exiting...", level="error")
-                break
-
-            if self.dealer in events:
-                liveness = self.heartbeat_liveness
-                empty, msg_type, *others = self.dealer.recv_multipart()
-                assert empty == const.EMPTY, "Empty delimiter must be const.EMPTY"
-                if msg_type == const.HEARTBEAT:
-                    liveness = self.heartbeat_liveness
-                elif msg_type == const.CALL:
-                    pair.send_multipart([empty, msg_type, *others])
-                elif msg_type == const.DISCONNECT:
-                    self._reconnect_to_broker()
-                else:
-                    self.logger(["received unknown message type", msg_type], level="error")
-            else:
-                liveness -= 1
-                if liveness == 0:
-                    self.logger(["lost connection to broker, retrying to connect to the broker..."])
-                    self._reconnect_to_broker()
-                    liveness = self.heartbeat_liveness
-            
-            if pair in events:
-                empty, msg_type, *others = pair.recv_multipart()
-                if msg_type == const.HEARTBEAT:
-                    pass  # ignore the heartbeat message
-                elif msg_type == TaskManager.TYPE_LOGGER:
-                    level = others[0].decode()
-                    others = others[1:]
-                    self.logger(others, level=level)
-                else:
-                    self.dealer.send_multipart([empty, msg_type, *others])
-
-            if time.time() > heartbeat_at:
-                self.dealer.send_multipart([
-                    const.EMPTY, 
-                    const.HEARTBEAT
-                ])
-                heartbeat_at = time.time() + self.heartbeat_interval * 1e-3
-
-    def _reconnect_to_broker(self):
-        if self.dealer:
-            self.poller.unregister(self.dealer)
-            self.dealer.close()
-            self.dealer = None
-            self.logger(["Service name =", self.service_name, f"reconnect to {self.broker_addr}"])
-        else:
-            self.logger(["Service name =", self.service_name, f"connect to {self.broker_addr}"])
-        self.dealer: zmq.Socket = self.ctx.socket(zmq.DEALER)
-        self.dealer.linger = 1
-        self.dealer.connect(self.broker_addr)
-        self.poller.register(self.dealer, zmq.POLLIN)
-        time.sleep(0.1)  # wait for connection to establish
-        self.dealer.send_multipart([
-            const.EMPTY,
-            const.REGISTER,
-            self.service_name.encode(),
-        ])
-
-    def _default_fn(self, *requests: list[bytes]) -> list[bytes]:
-        return [
-            json.dumps({
-                "status": 200,
-                "msg": "success",
-                "data": sorted(list(functions.keys())),
-            }).encode()
-        ]
-
-    def _test_pair(self, pair: zmq.Socket) -> bool:
-        """Test if the pair is connected."""
-        while True:
-            pair.send_multipart([const.EMPTY, const.HEARTBEAT])
-            try:
-                events = dict(self.poller.poll(self.heartbeat_interval))
-            except KeyboardInterrupt:
-                self.logger("Interrupted caused by KeyboardInterrupt, exiting...", level="error")
-                return False
-            if pair in events:
-                return True
-
-    def _test_worker_alive(self, worker_thread: threading.Thread) -> bool:
-        """Test if the worker thread is alive."""
-        if worker_thread.is_alive():
-            return True
-        else:
-            self.logger("Worker thread is not alive, exiting...", level="error")
-            return False
-        
-    def _worker_thread(self):
-
-        pair: zmq.Socket = self.ctx.socket(zmq.PAIR)
-        pair.linger = 1
-        pair.bind(self.internal_addr)
-        time.sleep(0.1)  # wait for connection to establish
-
-        poller: zmq.Poller = zmq.Poller()
-        poller.register(pair, zmq.POLLIN)
-
-        while True:
-            try:
-                events = dict(poller.poll(self.heartbeat_interval))
-            except KeyboardInterrupt:
-                self.logger("Interrupted caused by KeyboardInterrupt, exiting...", level="error")
-                break
-
-            if pair in events:
-                empty, msg_type, *others = pair.recv_multipart()
-                if msg_type == const.HEARTBEAT:
-                    pair.send_multipart([const.EMPTY, const.HEARTBEAT])
-                elif msg_type == const.CALL:
-                    router_chain_len = int.from_bytes(others[0], "big") if others[0] != const.EMPTY else 0
-                    router_chain = others[1:router_chain_len+1]
-                    others = others[router_chain_len+1:]
-                    service_name: str = others[0].decode()
-                    if service_name.startswith(const.SERVICE_SPLIT):
-                        service_name: str = service_name[len(const.SERVICE_SPLIT):]
-                    service_name: list[str] = service_name.split(const.SERVICE_SPLIT)
-                    if service_name[0] != self.service_name:
-                        pair.send_multipart([
-                            const.EMPTY,
-                            const.REPLY,
-                            router_chain_len.to_bytes(1, "big"),
-                            *router_chain,
-                            const.SERVICE_NOT_FOUND,
-                        ])
-                    else:
-                        if len(service_name) == 1:
-                            fn = self._default_fn
-                        else:
-                            fn = functions.get(service_name[1], self._default_fn)
-                        pair.send_multipart([
-                            const.EMPTY, 
-                            const.REPLY,
-                            router_chain_len.to_bytes(1, "big") if router_chain_len > 0 else const.EMPTY,
-                            *router_chain,
-                            *self._exception_wrapper(
-                                fn,
-                                self,
-                                *others[1:],
-                            ),
-                        ])
-
-            self.watchdogs.run()
-
-    def _exception_wrapper(self, fn, *requests: list[bytes]) -> list[bytes]:
         try:
-            return fn(*requests)
+            self.sql_conn.close()
         except Exception as e:
-            return [json.dumps({
-                "status": 400,
-                "msg": f"Exception when call {fn.__name__}, the excption is " + str(e)
-            }).encode()]
+            pass
 
-    @register
+    def _run(self):
+        # try to kill the finished or killing tasks
+        for task_id, task in self._tasks.items():
+            if task["status"] == TaskWorker.TASK_STATUS.running:
+                handler = task["handler"]
+                if handler.poll() is not None:
+                    task["status"] = TaskWorker.TASK_STATUS.finished
+                    task["end_time"] = time.time()
+                    task["pid"] = handler.pid
+                    if task["stdout"] != subprocess.PIPE: task["stdout"].close()
+                    if task["stderr"] != subprocess.PIPE: task["stderr"].close()
+            elif task["status"] == TaskWorker.TASK_STATUS.killing:
+                handler = task["handler"]
+                if handler.poll() is None:
+                    terminate_process_tree(handler.pid)
+                else:
+                    task["status"] = TaskWorker.TASK_STATUS.finished
+                    task["end_time"] = time.time()
+                    task["pid"] = handler.pid
+                    if task["stdout"] != subprocess.PIPE: task["stdout"].close()
+                    if task["stderr"] != subprocess.PIPE: task["stderr"].close()
+
+        # try to start a new task
+        has_running = False
+        for task_id, task in self._tasks.items():
+            if task["status"] == TaskWorker.TASK_STATUS.running:
+                has_running = True
+                break
+        if not has_running:
+            # try to start a new task
+            for task_id, task in self._tasks.items():
+                if task["status"] == TaskWorker.TASK_STATUS.waiting:
+                    task["status"] = TaskWorker.TASK_STATUS.running
+                    task["handler"] = subprocess.Popen(task["args"], stdout=task["stdout"], stderr=task["stderr"])
+                    task["pid"] = task["handler"].pid
+                    break
+
+        # save the finished tasks to sql
+        for task_id, task in self._tasks.items():
+            if task["status"] == TaskWorker.TASK_STATUS.finished:
+                self._write_to_sql(task_id, task)
+                del self._tasks[task_id]
+
+    def _write_to_sql(self, task_id: str, task: dict) -> None:
+        sql = """
+        insert into task(
+            uuid, task_name, args, uid, start_time, end_time
+        )
+        values(
+            %(uuid)s, %(task_name)s, %(args)s, %(uid)s, %(start_time)s, %(end_time)s
+        )
+        """
+        try:
+            self.cursor.execute(sql, {
+                "uuid": task_id,
+                "task_name": task["task_name"],
+                "args": json.dumps(task["args"]),
+                "uid": task["uid"],
+                "start_time": datetime.datetime.fromtimestamp(task["start_time"]).strftime("%Y-%m-%d %H:%M:%S"),
+                "end_time": datetime.datetime.fromtimestamp(task["end_time"]).strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            self.sql_conn.commit()
+        except Exception as e:
+            self.logger(f"Write task to sql failed, the exception is {e}, {task}", level="error")
+
+    def _check_uid(self, uid: int) -> bool:
+        sql = "select * from user where uid = %s"
+        self.cursor.execute(sql, (uid,))
+        return len(self.cursor.fetchall()) > 0
+
     def create_task(self, *requests: list[bytes]) -> list[bytes]:
-        """
-        Create a task.
-        """
+        """Create a task."""
         requests = json.loads(requests[0])
-        assert "args" in requests, "args must be in the requests"
+
+        assert "task_name" in requests, "task_name is required"
+        task_name = requests.get("task_name", None)
+        assert isinstance(task_name, str), "task_name must be a string"
+
+        assert "args" in requests, "args is required"
+        args = requests.get("args", None)
+        assert isinstance(args, list), "args must be a list"
+        
+        assert "uid" in requests, "uid is required"
+        uid = requests.get("uid", None)
+        assert isinstance(uid, int), "uid must be a int"
+        assert self._check_uid(uid), "uid not exists"
+
         task_id = utils.get_uuid()
-        args = requests["args"]
         stdout = requests.get("stdout", None)
         stderr = requests.get("stderr", None)
-        self.watchdogs.create_task(task_id, args, stdout=stdout, stderr=stderr)
-        return [json.dumps({
-            "status": 200,
-            "msg": "success",
-            "data": task_id,
-        }).encode()]
-    
-    @register
-    def kill_task(self, *requests: list[bytes]) -> list[bytes]:
-        """
-        Kill a task.
-        """
-        requests = json.loads(requests[0])
-        task_ids = requests.get("task_ids", [])
-        return_msg = []
-        for task_id in task_ids:
-            task_status = self.watchdogs.kill_task(task_id)
-            return_msg.append({
-                "task_id": task_id,
-                "status": task_status,
-            })
-        return [json.dumps({
-            "status": 200,
-            "msg": "success",
-            "data": return_msg,
-        }).encode()]
-    
-    @register
-    def get_task_info(self, *requests: list[bytes]) -> list[bytes]:
-        """
-        Get task status.
-        """
-        requests = json.loads(requests[0])
-        task_ids = requests.get("task_ids", [])
-        return_msg = []
-        for task_id in task_ids:
-            task_status = self.watchdogs.get_task_info(task_id)
-            return_msg.append({
-                "task_id": task_id,
-                "data": task_status,
-            })
+        if len(self._tasks) >= self.max_task_num:
+            return [json.dumps({
+                "status": 403,
+                "msg": "task limit reached",
+                "data": None,
+            }).encode()]
+        else:
+            self._tasks[task_id] = {
+                "task_name": task_name,
+                "args": args,
+                "uid": uid,
+                "status": TaskWorker.TASK_STATUS.waiting,
+                "start_time": time.time(),
+                "end_time": None,
+                "stdout": open(stdout, "w") if stdout else subprocess.PIPE,
+                "stderr": open(stderr, "w") if stderr else subprocess.PIPE,
+                "handler": None,
+                "pid": None,
+            }
 
-        return [json.dumps({
-            "status": 200,
-            "msg": "success",
-            "data": return_msg,
-        }).encode()]
+            return [json.dumps({
+                "status": 200,
+                "msg": "success",
+                "data": {
+                    "task_id": task_id,
+                    "start_time": self._tasks[task_id]["start_time"],
+                }
+            }).encode()]
+
+    def kill_task(self, *requests: list[bytes]) -> list[bytes]:
+        """Kill a task."""
+        requests = json.loads(requests[0])
+        assert "task_ids" in requests, "task_id is required"
+        task_ids = requests["task_ids"]
+        assert isinstance(task_ids, list), "task_id must be a list"
+        result = {}
+        for task_id in task_ids:
+            task = self._tasks.get(task_id, None)
+            if task is None:
+                result[task_id] = {
+                    "status": 404,
+                    "msg": "task not found",
+                    "data": None,
+                }
+                continue
+            if (
+                task["status"] == TaskWorker.TASK_STATUS.waiting or 
+                task["status"] == TaskWorker.TASK_STATUS.finished
+            ):
+                next_status = TaskWorker.TASK_STATUS.finished
+            elif (
+                task["status"] == TaskWorker.TASK_STATUS.running or
+                task["status"] == TaskWorker.TASK_STATUS.killing
+            ):
+                next_status = TaskWorker.TASK_STATUS.killing
+            task["status"] = next_status
+            result[task_id] = {
+                "status": 200,
+                "msg": "success",
+                "data": None,
+            }
+        return [json.dumps(result).encode()]
+
+    def get_task_info(self, *requests: list[bytes]) -> list[bytes]:
+        """Get task info."""
+        requests = json.loads(requests[0])
+        assert "task_ids" in requests, "task_id is required"
+        task_ids = requests["task_ids"]
+        assert isinstance(task_ids, list), "task_ids must be a list"
+        result = {}
+        for task_id in task_ids:
+            task = self._tasks.get(task_id, None)
+            if task is None:
+                result[task_id] = {
+                    "status": 404,
+                    "msg": "task not found",
+                    "data": None,
+                }
+            else:
+                result[task_id] = {
+                    "status": 200,
+                    "msg": "success",
+                    "data": {
+                        "status": task["status"].name,
+                        "start_time": task["start_time"],
+                        "end_time": task["end_time"],
+                        "pid": task["pid"],
+                    }
+                }
+        return [json.dumps(result).encode()]
+
+def create_worker(
+    max_task_num: int,
+    mysql_host: str,
+    mysql_user: str,
+    mysql_password: str,
+    mysql_database: str,
+    mysql_charset: str,
+    node_name: str,
+    broker_addr: str,
+    internal_addr: str,
+    logger_addr: str,
+    heartbeat_liveness: int = 5,
+    heartbeat_interval: int = 2500,
+    ctx: zmq.Context = None,
+) -> WorkerNode:
+    worker = TaskWorker(
+        max_task_num=max_task_num,
+        mysql_host=mysql_host,
+        mysql_user=mysql_user,
+        mysql_password=mysql_password,
+        mysql_database=mysql_database,
+        mysql_charset=mysql_charset
+    )
+    worker_node = WorkerNode(
+        node_name=node_name,
+        broker_addr=broker_addr,
+        internal_addr=internal_addr,
+        logger_addr=logger_addr,
+        worker_instance=worker,
+        heartbeat_liveness=heartbeat_liveness,
+        heartbeat_interval=heartbeat_interval,
+        ctx=ctx,
+    )
+    return worker_node

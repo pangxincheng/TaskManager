@@ -220,55 +220,42 @@ class BrokerNode(BaseNode):
                     router_chain_len = int.from_bytes(others[0], "big") if others[0] != const.EMPTY else 0
                     router_chain = others[1:router_chain_len+1]
                     others = others[router_chain_len+1:]
-                    service_name: str = others[0].decode()
+                    service_name: str = others[0].decode()  # "/" or "/xxx"
                     if service_name.startswith(const.SERVICE_SPLIT):
-                        service_name: str = service_name[len(const.SERVICE_SPLIT):]
+                        service_name: str = service_name[len(const.SERVICE_SPLIT):] # "" or "xxx"
                     service_name: list[str] = service_name.split(const.SERVICE_SPLIT)
-                    if service_name[0] != self.node_name:
+                    if service_name[0] == "":
+                        msg: list[bytes] = self.builtin_service(sender_identity, router_chain, service_name, others[1:])
                         self.router.send_multipart([
                             sender_identity,
                             const.EMPTY,
                             const.REPLY,
                             router_chain_len.to_bytes(1, "big") if router_chain_len > 0 else const.EMPTY,
                             *router_chain,
-                            const.SERVICE_NOT_FOUND,
+                            *msg,
                         ])
                     else:
-                        if (
-                            len(service_name) == 1 or 
-                            (len(service_name) == 2 and service_name[1] == "")
-                        ):
-                            msg: list[bytes] = self.builtin_service(sender_identity, router_chain, service_name, others[1:])
+                        service = self.find_service(service_name[0], create_if_not_exists=False)
+                        if service is None:
                             self.router.send_multipart([
                                 sender_identity,
                                 const.EMPTY,
                                 const.REPLY,
                                 router_chain_len.to_bytes(1, "big") if router_chain_len > 0 else const.EMPTY,
                                 *router_chain,
-                                *msg,
+                                const.SERVICE_NOT_FOUND,
                             ])
                         else:
-                            service = self.find_service(service_name[1], create_if_not_exists=False)
-                            if service is None:
-                                self.router.send_multipart([
-                                    sender_identity,
-                                    const.EMPTY,
-                                    const.REPLY,
-                                    router_chain_len.to_bytes(1, "big") if router_chain_len > 0 else const.EMPTY,
-                                    *router_chain,
-                                    const.SERVICE_NOT_FOUND,
-                                ])
-                            else:
-                                self.dispatch(
-                                    service=service,
-                                    msg=[
-                                        const.CALL,
-                                        (router_chain_len+1).to_bytes(1, "big"), 
-                                        *(router_chain + [sender_identity]), 
-                                        (const.SERVICE_SPLIT + const.SERVICE_SPLIT.join(service_name[1:])).encode(),
-                                        *others[1:],
-                                    ]
-                                )
+                            self.dispatch(
+                                service=service,
+                                msg=[
+                                    const.CALL,
+                                    (router_chain_len+1).to_bytes(1, "big"), 
+                                    *(router_chain + [sender_identity]), 
+                                    (const.SERVICE_SPLIT + const.SERVICE_SPLIT.join(service_name[1:])).encode(),
+                                    *others[1:],
+                                ]
+                            )
                 elif msg_type == const.REPLY:
                     if node:
                         router_chain_len = int.from_bytes(others[0], "big") if others[0] != const.EMPTY else 0
