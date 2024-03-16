@@ -198,6 +198,7 @@ class WorkerNode(BaseNode):
         
         def _logger(msg: Union[str, bytes, list, dict], level: str = "info") -> None:
             try:
+                print(msg)
                 pair.send_multipart([
                     const.EMPTY,
                     WorkerNode.TYPE_LOGGER,
@@ -207,7 +208,7 @@ class WorkerNode(BaseNode):
             except Exception as e:
                 pass
         # bind the logger function to the worker_instance
-        self.worker_instance._logger = _logger
+        self.worker_instance.logger = _logger
 
         while True:
             try:

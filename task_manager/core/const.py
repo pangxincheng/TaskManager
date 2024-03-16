@@ -16,4 +16,4 @@ REGISTER   = b'\005'
 
 # others
 SERVICE_SPLIT = '/'
-SERVICE_NOT_FOUND = b'{"status":404,"msg":"Service not found"}'
+SERVICE_NOT_FOUND = b'{"status":400,"msg":"service not found"}'

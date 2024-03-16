@@ -76,6 +76,7 @@ class TaskWorker(Worker):
                     task["status"] = TaskWorker.TASK_STATUS.finished
                     task["end_time"] = time.time()
                     task["pid"] = handler.pid
+                    task["return_code"] = handler.returncode
                     if task["stdout"] != subprocess.PIPE: task["stdout"].close()
                     if task["stderr"] != subprocess.PIPE: task["stderr"].close()
             elif task["status"] == TaskWorker.TASK_STATUS.killing:
@@ -86,6 +87,7 @@ class TaskWorker(Worker):
                     task["status"] = TaskWorker.TASK_STATUS.finished
                     task["end_time"] = time.time()
                     task["pid"] = handler.pid
+                    task["return_code"] = handler.returncode
                     if task["stdout"] != subprocess.PIPE: task["stdout"].close()
                     if task["stderr"] != subprocess.PIPE: task["stderr"].close()
 
@@ -114,10 +116,10 @@ class TaskWorker(Worker):
     def _write_to_sql(self, task_id: str, task: dict) -> None:
         sql = """
         insert into task(
-            uuid, task_name, args, uid, start_time, end_time, node_name
+            uuid, task_name, args, uid, start_time, end_time, node_name, return_code, pid
         )
         values(
-            %(uuid)s, %(task_name)s, %(args)s, %(uid)s, %(start_time)s, %(end_time)s, %(node_name)s
+            %(uuid)s, %(task_name)s, %(args)s, %(uid)s, %(start_time)s, %(end_time)s, %(node_name)s, %(return_code)s, %(pid)s
         )
         """
         try:
@@ -128,7 +130,9 @@ class TaskWorker(Worker):
                 "uid": task["uid"],
                 "start_time": datetime.datetime.fromtimestamp(task["start_time"]).strftime("%Y-%m-%d %H:%M:%S"),
                 "end_time": datetime.datetime.fromtimestamp(task["end_time"]).strftime("%Y-%m-%d %H:%M:%S"),
-                "node_name": self._node_name
+                "node_name": self._node_name,
+                "return_code": task["return_code"],
+                "pid": task["pid"],
             })
             self.sql_conn.commit()
         except Exception as e:
@@ -177,6 +181,7 @@ class TaskWorker(Worker):
                 "stderr": open(stderr, "w") if stderr else subprocess.PIPE,
                 "handler": None,
                 "pid": None,
+                "return_code": None,
             }
 
             return [json.dumps({
@@ -191,64 +196,57 @@ class TaskWorker(Worker):
     def kill_task(self, *requests: list[bytes]) -> list[bytes]:
         """Kill a task."""
         requests = json.loads(requests[0])
-        assert "task_ids" in requests, "task_id is required"
-        task_ids = requests["task_ids"]
-        assert isinstance(task_ids, list), "task_id must be a list"
-        result = {}
-        for task_id in task_ids:
-            task = self._tasks.get(task_id, None)
-            if task is None:
-                result[task_id] = {
-                    "status": 404,
-                    "msg": "task not found",
-                    "data": None,
-                }
-                continue
-            if (
-                task["status"] == TaskWorker.TASK_STATUS.waiting or 
-                task["status"] == TaskWorker.TASK_STATUS.finished
-            ):
-                next_status = TaskWorker.TASK_STATUS.finished
-            elif (
-                task["status"] == TaskWorker.TASK_STATUS.running or
-                task["status"] == TaskWorker.TASK_STATUS.killing
-            ):
-                next_status = TaskWorker.TASK_STATUS.killing
-            task["status"] = next_status
-            result[task_id] = {
-                "status": 200,
-                "msg": "success",
+        assert "task_id" in requests, "task_id is required"
+        task_id = requests["task_id"]
+        assert isinstance(task_id, str), "task_id must be a str"
+        task = self._tasks.get(task_id, None)
+        if task is None:
+            return [json.dumps({
+                "status": 400,
+                "msg": "task not found",
                 "data": None,
-            }
-        return [json.dumps(result).encode()]
+            }).encode()]
+        if (
+            task["status"] == TaskWorker.TASK_STATUS.waiting or 
+            task["status"] == TaskWorker.TASK_STATUS.finished
+        ):
+            next_status = TaskWorker.TASK_STATUS.finished
+        elif (
+            task["status"] == TaskWorker.TASK_STATUS.running or
+            task["status"] == TaskWorker.TASK_STATUS.killing
+        ):
+            next_status = TaskWorker.TASK_STATUS.killing
+        task["status"] = next_status
+        return [json.dumps({
+            "status": 200,
+            "msg": "success",
+            "data": None,
+        }).encode()]
 
     def get_task_info(self, *requests: list[bytes]) -> list[bytes]:
         """Get task info."""
         requests = json.loads(requests[0])
-        assert "task_ids" in requests, "task_id is required"
-        task_ids = requests["task_ids"]
-        assert isinstance(task_ids, list), "task_ids must be a list"
-        result = {}
-        for task_id in task_ids:
-            task = self._tasks.get(task_id, None)
-            if task is None:
-                result[task_id] = {
-                    "status": 404,
-                    "msg": "task not found",
-                    "data": None,
+        assert "task_id" in requests, "task_id is required"
+        task_id = requests["task_id"]
+        assert isinstance(task_id, str), "task_id must be a str"
+        task = self._tasks.get(task_id, None)
+        if task is None:
+            return [json.dumps({
+                "status": 400,
+                "msg": "task not found",
+                "data": None,
+            }).encode()]
+        else:
+            return [json.dumps({
+                "status": 200,
+                "msg": "success",
+                "data": {
+                    "status": task["status"].name,
+                    "start_time": datetime.datetime.fromtimestamp(task["start_time"]).strftime("%Y-%m-%d %H:%M:%S"),
+                    "end_time": None,
+                    "pid": task["pid"],
                 }
-            else:
-                result[task_id] = {
-                    "status": 200,
-                    "msg": "success",
-                    "data": {
-                        "status": task["status"].name,
-                        "start_time": task["start_time"],
-                        "end_time": task["end_time"],
-                        "pid": task["pid"],
-                    }
-                }
-        return [json.dumps(result).encode()]
+            }).encode()]
 
 def create_worker(
     max_task_num: int,
