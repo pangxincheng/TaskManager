@@ -129,8 +129,8 @@ class WatchDogManager:
 
 class GPUWorker(Worker):
 
-    def __init__(self, unit: str = "MiB", chunk_size: int = 512) -> None:
-        super().__init__()
+    def __init__(self, node_name: str, unit: str = "MiB", chunk_size: int = 512) -> None:
+        super().__init__(node_name)
         assert unit in ["B", "MiB", "GiB", "KiB"], "Invalid unit"
         self._unit: str = unit
         self._chunk_size: int = chunk_size
@@ -371,7 +371,7 @@ def create_worker(
     heartbeat_interval: int = 2500,
     ctx: zmq.Context = None,
 ) -> WorkerNode:
-    worker = GPUWorker(unit, chunk_size)
+    worker = GPUWorker(node_name, unit, chunk_size)
     worker_node = WorkerNode(
         node_name=node_name,
         broker_addr=broker_addr,

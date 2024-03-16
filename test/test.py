@@ -23,7 +23,7 @@ gpu_node_name = "localhost-gpu"
 gpu_internal_addr = "inproc:///tmp/gpu.sock"
 
 # task
-task_node_name = "task"
+task_node_name = "localhost-task"
 task_external_addr = "tcp://127.0.0.1:5558"
 task_internal_addr = "inproc:///tmp/task.sock"
 

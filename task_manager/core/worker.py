@@ -12,8 +12,8 @@ from task_manager.core.base import BaseNode
 
 class Worker:
 
-    def __init__(self) -> None:
-        pass
+    def __init__(self, node_name: str) -> None:
+        self._node_name = node_name
 
     def logger(self, msg: Union[str, bytes, list, dict], level: str = "info") -> None:
         pass

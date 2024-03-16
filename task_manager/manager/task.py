@@ -40,6 +40,7 @@ class TaskWorker(Worker):
 
     def __init__(
         self,
+        node_name,
         max_task_num: int,
         mysql_host: str,
         mysql_user: str,
@@ -47,7 +48,7 @@ class TaskWorker(Worker):
         mysql_database: str,
         mysql_charset: str = "utf8"
     ) -> None:
-        super().__init__()
+        super().__init__(node_name)
         self.max_task_num = max_task_num
         self.sql_conn = pymysql.connect(
             host=mysql_host,
@@ -104,7 +105,8 @@ class TaskWorker(Worker):
                     break
 
         # save the finished tasks to sql
-        for task_id, task in self._tasks.items():
+        for task_id  in list(self._tasks.keys()):
+            task = self._tasks[task_id]
             if task["status"] == TaskWorker.TASK_STATUS.finished:
                 self._write_to_sql(task_id, task)
                 del self._tasks[task_id]
@@ -112,10 +114,10 @@ class TaskWorker(Worker):
     def _write_to_sql(self, task_id: str, task: dict) -> None:
         sql = """
         insert into task(
-            uuid, task_name, args, uid, start_time, end_time
+            uuid, task_name, args, uid, start_time, end_time, node_name
         )
         values(
-            %(uuid)s, %(task_name)s, %(args)s, %(uid)s, %(start_time)s, %(end_time)s
+            %(uuid)s, %(task_name)s, %(args)s, %(uid)s, %(start_time)s, %(end_time)s, %(node_name)s
         )
         """
         try:
@@ -126,6 +128,7 @@ class TaskWorker(Worker):
                 "uid": task["uid"],
                 "start_time": datetime.datetime.fromtimestamp(task["start_time"]).strftime("%Y-%m-%d %H:%M:%S"),
                 "end_time": datetime.datetime.fromtimestamp(task["end_time"]).strftime("%Y-%m-%d %H:%M:%S"),
+                "node_name": self._node_name
             })
             self.sql_conn.commit()
         except Exception as e:
@@ -181,7 +184,7 @@ class TaskWorker(Worker):
                 "msg": "success",
                 "data": {
                     "task_id": task_id,
-                    "start_time": self._tasks[task_id]["start_time"],
+                    "start_time": datetime.datetime.fromtimestamp(self._tasks[task_id]["start_time"]).strftime("%Y-%m-%d %H:%M:%S"),
                 }
             }).encode()]
 
@@ -263,6 +266,7 @@ def create_worker(
     ctx: zmq.Context = None,
 ) -> WorkerNode:
     worker = TaskWorker(
+        node_name=node_name,
         max_task_num=max_task_num,
         mysql_host=mysql_host,
         mysql_user=mysql_user,

@@ -183,7 +183,7 @@ class CliController(cmd2.Cmd):
     def do_create_task(self, args):
         """Create task."""
         msg = self.client.send(
-            service_name="/task/create_task".encode(),
+            service_name="/localhost-task/create_task".encode(),
             request=[
                 json.dumps({
                     "stdout": args.stdout,
@@ -204,7 +204,7 @@ class CliController(cmd2.Cmd):
     def do_kill_task(self, args):
         """Kill task."""
         msg = self.client.send(
-            service_name="/task/kill_task".encode(),
+            service_name="/localhost-task/kill_task".encode(),
             request=[
                 json.dumps({
                     "task_ids": args.task_ids
@@ -220,7 +220,7 @@ class CliController(cmd2.Cmd):
     def do_get_task_info(self, args):
         """Get task info."""
         msg = self.client.send(
-            service_name="/task/get_task_info".encode(),
+            service_name="/localhost-task/get_task_info".encode(),
             request=[
                 json.dumps({
                     "task_ids": args.task_ids
