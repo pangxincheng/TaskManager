@@ -245,8 +245,32 @@ class TaskWorker(Worker):
                     "start_time": datetime.datetime.fromtimestamp(task["start_time"]).strftime("%Y-%m-%d %H:%M:%S"),
                     "end_time": None,
                     "pid": task["pid"],
+                    "args": json.dumps(task["args"]),
                 }
             }).encode()]
+
+    def get_task_info_by_uid(self, *requests: list[bytes]) -> list[bytes]:
+        """Get task info by uid."""
+        requests = json.loads(requests[0])
+        assert "uid" in requests, "uid is required"
+        uid = requests["uid"]
+        assert isinstance(uid, int), "uid must be a int"
+        result = {}
+        for task_id, task in self._tasks.items():
+            if task["uid"] == uid:
+                result[task_id] = {
+                    "status": task["status"].name,
+                    "start_time": datetime.datetime.fromtimestamp(task["start_time"]).strftime("%Y-%m-%d %H:%M:%S"),
+                    "end_time": None,
+                    "pid": task["pid"],
+                    "args": json.dumps(task["args"]),
+                }
+        
+        return [json.dumps({
+            "status": 200,
+            "msg": "success",
+            "data": result,
+        }).encode()]
 
 def create_worker(
     max_task_num: int,
