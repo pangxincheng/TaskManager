@@ -1,6 +1,6 @@
 import json
 import time
-from typing import Optional
+from typing import Optional, Dict, List
 
 import zmq
 
@@ -24,47 +24,16 @@ class ServiceInfo:
     def __init__(
         self,
         service_name: str = None,
-        nodes_ready: list[bytes] = None,
-        nodes_busy: list[bytes] = None,
-        requests: list[list[bytes]] = None,
+        nodes_ready: List[bytes] = None,
+        nodes_busy: List[bytes] = None,
+        requests: List[List[bytes]] = None,
     ) -> None:
         self.service_name: str = service_name
-        self.nodes_ready: list[bytes] = nodes_ready if nodes_ready is not None else []
-        self.nodes_busy: list[bytes] = nodes_busy if nodes_busy is not None else []
-        self.requests: list[bytes] = requests if requests is not None else []
+        self.nodes_ready: List[bytes] = nodes_ready if nodes_ready is not None else []
+        self.nodes_busy: List[bytes] = nodes_busy if nodes_busy is not None else []
+        self.requests: List[List[bytes]] = requests if requests is not None else []
 
 class BrokerNode(BaseNode):
-
-    def debug(self):
-        import rich
-        import rich.table
-        table = rich.table.Table(title="Services")
-        table.add_column("Service Name")
-        table.add_column("Workers Ready")
-        table.add_column("Workers Busy")
-        table.add_column("Requests")
-        for service_name, service in self.services.items():
-            table.add_row(
-                self.fmt(service_name),
-                self.fmt(len(service.nodes_ready)),
-                self.fmt(len(service.nodes_busy)),
-                self.fmt(service.requests),
-                end_section=True,
-            )
-        rich.print(table)
-        table = rich.table.Table(title="Workers")
-        table.add_column("Worker Name")
-        table.add_column("Expiry")
-        table.add_column("Service Name")
-        for node_name, node in self.nodes.items():
-            table.add_row(
-                self.fmt(node_name),
-                self.fmt(node.expiry),
-                self.fmt(node.service_name),
-                end_section=True,
-            )
-        rich.print(table)
-        rich.print("*"*80)
 
     def __init__(
         self,
@@ -72,7 +41,7 @@ class BrokerNode(BaseNode):
         logger_addr: str,
         external_addr: str,
         internal_addr: str,
-        heartbeat_liveness: int = 3,  
+        heartbeat_liveness: int = 5,
         heartbeat_interval: int = 2500,  # milliseconds
         ctx: zmq.Context = None,
     ) -> None:
@@ -81,11 +50,10 @@ class BrokerNode(BaseNode):
         self.internal_addr: str = internal_addr
         self.heartbeat_liveness: int = heartbeat_liveness
         self.heartbeat_interval: int = heartbeat_interval
-        self.heartbeat_expiry: float = 1e-3 * heartbeat_interval * heartbeat_liveness
-        self.heartbeat_at: float = time.time() + 1e-3 * heartbeat_interval
+        self.heartbeat_at: float = time.time() + 1e-3 * self.heartbeat_interval
 
-        self.services: dict[str, ServiceInfo] = {}
-        self.nodes: dict[bytes, NodeInfo] = {}
+        self.services: Dict[str, ServiceInfo] = {}
+        self.nodes: Dict[bytes, NodeInfo] = {}
 
         self.router: zmq.Socket = self.ctx.socket(zmq.ROUTER)
         self.router.linger = 1
@@ -94,11 +62,11 @@ class BrokerNode(BaseNode):
         if self.internal_addr is not None and self.internal_addr != self.external_addr:
             self.router.bind(self.internal_addr)
         time.sleep(0.1)  # wait for connection to establish
-        self.logger(f"Broker bound to {self.external_addr} and {self.internal_addr}")
+        self.logger(f"Broker bind to {self.external_addr} and {self.internal_addr}")
 
         self.poller: zmq.Poller = zmq.Poller()
         self.poller.register(self.router, zmq.POLLIN)
-    
+
     def __del__(self):
         self.destroy()
 
@@ -106,8 +74,8 @@ class BrokerNode(BaseNode):
         self.poller.unregister(self.router)
         self.router.close()
         return super().destroy()
-    
-    def builtin_service(self, *args, **kwargs) -> list[bytes]:
+
+    def builtin_service(self, sender_identity: bytes, router_chain: List[bytes], msg: List[bytes]) -> list[bytes]:
         """A builtin service for the broker to handle."""
         res = {}
         for service_name, service in self.services.items():
@@ -118,17 +86,17 @@ class BrokerNode(BaseNode):
             }
         return [json.dumps(res).encode()]
 
-    def find_service(self, service_name: str, create_if_not_exists: bool = True) -> ServiceInfo:
+    def find_service(self, service_name: str, create_if_not_exists: bool = True) -> Optional[ServiceInfo]:
         service = self.services.get(service_name, None)
-        if service is None and create_if_not_exists:
+        if not service and create_if_not_exists:
             service = ServiceInfo(service_name=service_name)
             self.services[service_name] = service
         return service
 
-    def add_node(self, node: NodeInfo):
+    def add_node(self, node: NodeInfo) -> None:
         if node.identity not in self.nodes:
             self.nodes[node.identity] = node
-        assert node.service_name in self.services, "Service name must be in self.services"
+        assert node.service_name in self.services, "Service must be in self.services"
         service = self.services[node.service_name]
         if node.identity in service.nodes_busy:
             service.nodes_busy.remove(node.identity)
@@ -136,7 +104,7 @@ class BrokerNode(BaseNode):
             service.nodes_ready.append(node.identity)
         self.dispatch(service)
 
-    def dispatch(self, service: ServiceInfo, msg: Optional[list[bytes]] = None):
+    def dispatch(self, service: ServiceInfo, msg: Optional[List[bytes]] = None) -> None:
         if msg is not None:
             service.requests.append(msg)
 
@@ -147,7 +115,7 @@ class BrokerNode(BaseNode):
             self.router.send_multipart([node_identity, const.EMPTY, *request])
             service.nodes_busy.append(node_identity)
 
-    def purge_nodes(self, service: Optional[ServiceInfo] = None):
+    def purge_nodes(self, service: Optional[ServiceInfo] = None) -> None:
         if service is None:
             for service in self.services.values():
                 self.purge_nodes(service)
@@ -173,14 +141,14 @@ class BrokerNode(BaseNode):
                 else:
                     break
 
-    def delete_node(self, node_identity: bytes):
+    def delete_node(self, node_identity: bytes) -> None:
         self.router.send_multipart([
             node_identity,
             const.EMPTY,
             const.DISCONNECT,
         ])
 
-    def purge_services(self):
+    def purge_services(self) -> None:
         delete_service_name = []
         for service_name, service in self.services.items():
             if not service.nodes_ready and not service.nodes_busy and not service.requests:
@@ -190,42 +158,42 @@ class BrokerNode(BaseNode):
                 self.services.pop(service_name)
             self.logger(["Purged services", delete_service_name])
 
-    def send_heartbeats(self):
+    def send_heartbeats(self) -> None:
         if time.time() > self.heartbeat_at:
             for node in self.nodes.values():
                 self.router.send_multipart([
-                    node.identity, 
-                    const.EMPTY, 
+                    node.identity,
+                    const.EMPTY,
                     const.HEARTBEAT
                 ])
             self.heartbeat_at = time.time() + 1e-3 * self.heartbeat_interval
 
     def run(self):
-        self.logger("Broker started working...")
+        self.logger("Broker start running...")
         self.heartbeat_at: float = time.time() + 1e-3 * self.heartbeat_interval
         while True:
             try:
                 events = dict(self.poller.poll(self.heartbeat_interval))
             except KeyboardInterrupt:
-                self.logger("Interrupted caused by KeyboardInterrupt, exiting...", level="error")
+                self.logger("Broker interrupted by KeyboardInterrupt, exiting...", level="error")
                 break
 
             if self.router in events:
                 sender_identity, empty, msg_type, *others = self.router.recv_multipart()
                 assert empty == const.EMPTY, "Empty delimiter must be const.EMPTY"
                 node = self.nodes.get(sender_identity, None)
-                if node: # update the expiry time
-                    node.expiry = time.time() + self.heartbeat_expiry
-                if msg_type == const.CALL:
+                if node:  # if the sender is a node, we update its expiry
+                    node.expiry = time.time() + 1e-3 * self.heartbeat_interval * self.heartbeat_liveness
+                if msg_type == const.CALL:  # if the sender sends a CALL message
                     router_chain_len = int.from_bytes(others[0], "big") if others[0] != const.EMPTY else 0
                     router_chain = others[1:router_chain_len+1]
                     others = others[router_chain_len+1:]
-                    service_name: str = others[0].decode()  # "/" or "/xxx"
+                    service_name: str = others[0].decode()  # "/" or "/xxx" or "xxx" or ""
                     if service_name.startswith(const.SERVICE_SPLIT):
-                        service_name: str = service_name[len(const.SERVICE_SPLIT):] # "" or "xxx"
-                    service_name: list[str] = service_name.split(const.SERVICE_SPLIT)
+                        service_name: str = service_name[len(const.SERVICE_SPLIT):]  # "xxx" or ""
+                    service_name: List[str] = service_name.split(const.SERVICE_SPLIT)
                     if service_name[0] == "":
-                        msg: list[bytes] = self.builtin_service(sender_identity, router_chain, service_name, others[1:])
+                        msg: list[bytes] = self.builtin_service(sender_identity, router_chain, others[1:])
                         self.router.send_multipart([
                             sender_identity,
                             const.EMPTY,
@@ -236,7 +204,7 @@ class BrokerNode(BaseNode):
                         ])
                     else:
                         service = self.find_service(service_name[0], create_if_not_exists=False)
-                        if service is None:
+                        if not service:
                             self.router.send_multipart([
                                 sender_identity,
                                 const.EMPTY,
@@ -250,14 +218,14 @@ class BrokerNode(BaseNode):
                                 service=service,
                                 msg=[
                                     const.CALL,
-                                    (router_chain_len+1).to_bytes(1, "big"), 
-                                    *(router_chain + [sender_identity]), 
+                                    (router_chain_len+1).to_bytes(1, "big"),
+                                    *(router_chain + [sender_identity]),
                                     (const.SERVICE_SPLIT + const.SERVICE_SPLIT.join(service_name[1:])).encode(),
                                     *others[1:],
                                 ]
                             )
-                elif msg_type == const.REPLY:
-                    if node:
+                elif msg_type == const.REPLY:  # if the sender sends a REPLY message
+                    if node:  # if the sender is a node
                         router_chain_len = int.from_bytes(others[0], "big") if others[0] != const.EMPTY else 0
                         router_chain = others[1:router_chain_len+1]
                         others = others[router_chain_len+1:]
@@ -265,36 +233,34 @@ class BrokerNode(BaseNode):
                             router_chain[-1],
                             const.EMPTY,
                             const.REPLY,
-                            (router_chain_len-1).to_bytes(1, 'big') if router_chain_len-1 > 0 else const.EMPTY,
+                            (router_chain_len-1).to_bytes(1, "big") if router_chain_len > 1 else const.EMPTY,
                             *router_chain[:-1],
                             *others,
                         ])
                         self.add_node(node)
-                    else:
+                    else:  # if the sender is not a node/is a dead node
                         self.delete_node(sender_identity)
                 elif msg_type == const.REGISTER:
                     if node:
                         self.logger(["Node", sender_identity, "has already registered"], level="warn")
                     else:
-                        assert len(others) == 1, "Invalid message format"
-                        service_name = others[0].decode()
+                        assert len(others) == 1, "The message should contain only one service name"
+                        service_name: str = others[0].decode()
                         service = self.find_service(service_name)
                         node = NodeInfo(
                             identity=sender_identity,
-                            expiry=time.time() + self.heartbeat_expiry,
-                            service_name=service.service_name,
+                            expiry=time.time() + 1e-3 * self.heartbeat_interval * self.heartbeat_liveness,
+                            service_name=service_name,
                         )
-                        self.logger(["Node", sender_identity, "registered for service", service.service_name])
+                        self.logger(["Node", sender_identity, "registered for service", service_name])
                         self.add_node(node)
                 elif msg_type == const.DISCONNECT:
-                    self.logger(["Node", sender_identity, "send a disconnect command"])
+                    self.logger([sender_identity, "send a DISCONNECT message"])
                     if node: node.expiry = time.time()
                 elif msg_type == const.HEARTBEAT:
                     if not node: self.delete_node(sender_identity)
                 else:
-                    self.logger(["Invalid message type", msg_type, "from ", sender_identity], level="error")
-            
-            # self.debug()
+                    self.logger(["Unknown message type", msg_type, "from", sender_identity], level="error")
 
             # purge dead nodes
             self.purge_nodes()

@@ -10,6 +10,7 @@ import task_manager.core.const as const
 import task_manager.manager.utils as utils
 from task_manager.core.base import BaseNode
 
+
 class Worker:
 
     def __init__(self, node_name: str) -> None:
@@ -21,19 +22,20 @@ class Worker:
     def _run(self):
         pass
 
+
 class WorkerNode(BaseNode):
     TYPE_LOGGER = b"logger"
 
     def __init__(
-        self,
-        node_name: str, 
-        broker_addr: str,
-        internal_addr: str,
-        logger_addr: str, 
-        worker_instance: Worker,
-        heartbeat_liveness: int = 5,
-        heartbeat_interval: int = 2500,
-        ctx: zmq.Context = None
+            self,
+            node_name: str,
+            broker_addr: str,
+            internal_addr: str,
+            logger_addr: str,
+            worker_instance: Worker,
+            heartbeat_liveness: int = 5,
+            heartbeat_interval: int = 2500,
+            ctx: zmq.Context = None
     ) -> None:
         super().__init__(node_name, logger_addr, ctx)
         self.broker_addr: str = broker_addr
@@ -48,7 +50,7 @@ class WorkerNode(BaseNode):
 
         self.functions = dict(
             inspect.getmembers(
-                object=self.worker_instance, 
+                object=self.worker_instance,
                 predicate=_predicate
             )
         )
@@ -106,7 +108,7 @@ class WorkerNode(BaseNode):
                     self.logger(["lost connection to broker, retrying to connect to the broker..."])
                     self._reconnect_to_broker()
                     liveness = self.heartbeat_liveness
-            
+
             if pair in events:
                 empty, msg_type, *others = pair.recv_multipart()
                 if msg_type == const.HEARTBEAT:
@@ -120,7 +122,7 @@ class WorkerNode(BaseNode):
 
             if time.time() > heartbeat_at:
                 self.dealer.send_multipart([
-                    const.EMPTY, 
+                    const.EMPTY,
                     const.HEARTBEAT
                 ])
                 heartbeat_at = time.time() + self.heartbeat_interval * 1e-3
@@ -195,7 +197,6 @@ class WorkerNode(BaseNode):
         poller: zmq.Poller = zmq.Poller()
         poller.register(pair, zmq.POLLIN)
 
-        
         def _logger(msg: Union[str, bytes, list, dict], level: str = "info") -> None:
             try:
                 print(msg)
@@ -207,6 +208,7 @@ class WorkerNode(BaseNode):
                 ])
             except Exception as e:
                 pass
+
         # bind the logger function to the worker_instance
         self.worker_instance.logger = _logger
 
@@ -223,8 +225,8 @@ class WorkerNode(BaseNode):
                     pair.send_multipart([const.EMPTY, const.HEARTBEAT])
                 elif msg_type == const.CALL:
                     router_chain_len = int.from_bytes(others[0], "big") if others[0] != const.EMPTY else 0
-                    router_chain = others[1:router_chain_len+1]
-                    others = others[router_chain_len+1:]
+                    router_chain = others[1:router_chain_len + 1]
+                    others = others[router_chain_len + 1:]
                     service_name: str = others[0].decode()
                     if service_name.startswith(const.SERVICE_SPLIT):
                         service_name: str = service_name[len(const.SERVICE_SPLIT):]
@@ -234,7 +236,7 @@ class WorkerNode(BaseNode):
                     else:
                         fn = self.functions.get(service_name[0], self._default_fn)
                     pair.send_multipart([
-                        const.EMPTY, 
+                        const.EMPTY,
                         const.REPLY,
                         router_chain_len.to_bytes(1, "big") if router_chain_len > 0 else const.EMPTY,
                         *router_chain,

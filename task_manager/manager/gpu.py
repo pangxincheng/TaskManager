@@ -21,7 +21,7 @@ class WatchDogManager:
 
     def __contains__(self, device_id: int) -> bool:
         return device_id in self._gpus
-    
+
     def get_watchdog_info(self, device_id: int) -> dict:
         if device_id in self._gpus:
             gpu = self._gpus[device_id]
@@ -49,7 +49,7 @@ class WatchDogManager:
             return True
         except Exception as e:
             return False
-    
+
     def remove_watchdog(self, device_id: int) -> bool:
         try:
             if device_id in self._gpus:
@@ -62,7 +62,7 @@ class WatchDogManager:
                 return False
         except Exception as e:
             return False
-        
+
     def allocate_memory(self, device_id: int, mem_size: int):
         try:
             if device_id in self._gpus:
@@ -177,7 +177,7 @@ class GPUWorker(Worker):
         assert all([isinstance(device_id, int) for device_id in device_ids]), "device_ids should be a list of integers"
         assert all([device_id >= 0 and device_id < pynvml.nvmlDeviceGetCount() for device_id in device_ids]), "device_ids should be in the valid range"
         assert all([device_id not in self._watchdogs for device_id in device_ids]), "device_ids should not contain duplicate elements"
-        
+
         return_msg = []
         for device_id in device_ids:
             if self._watchdogs.add_watchdog(device_id):
@@ -192,7 +192,7 @@ class GPUWorker(Worker):
                     "status": 400,
                     "msg": "failed",
                 })
-        
+
         return [
             json.dumps({
                 "status": 200,
@@ -210,7 +210,7 @@ class GPUWorker(Worker):
         assert all([isinstance(device_id, int) for device_id in device_ids]), "device_ids should be a list of integers"
         assert all([device_id >= 0 and device_id < pynvml.nvmlDeviceGetCount() for device_id in device_ids]), "device_ids should be in the valid range"
         assert all([device_id in self._watchdogs for device_id in device_ids]), "device_ids should not contain duplicate elements"
-        
+
         return_msg = []
         for device_id in device_ids:
             if self._watchdogs.remove_watchdog(device_id):
@@ -225,7 +225,7 @@ class GPUWorker(Worker):
                     "status": 400,
                     "msg": "failed",
                 })
-        
+
         return [
             json.dumps({
                 "status": 200,
@@ -266,7 +266,7 @@ class GPUWorker(Worker):
                     "status": 400,
                     "msg": "failed",
                 })
-        
+
         return [
             json.dumps({
                 "status": 200,
@@ -307,7 +307,7 @@ class GPUWorker(Worker):
                     "status": 400,
                     "msg": "failed",
                 })
-        
+
         return [
             json.dumps({
                 "status": 200,
@@ -337,7 +337,7 @@ class GPUWorker(Worker):
         for device_id, mem_size, unit in zip(device_ids, mem_sizes, units):
             mem_size = utils.to_bytes(mem_size, unit)
             if self._watchdogs.auto_preempt_memory(
-                device_id=device_id, 
+                device_id=device_id,
                 mem_size=mem_size,
             ):
                 return_msg.append({
@@ -351,7 +351,7 @@ class GPUWorker(Worker):
                     "status": 400,
                     "msg": "failed",
                 })
-        
+
         return [
             json.dumps({
                 "status": 200,
@@ -361,7 +361,7 @@ class GPUWorker(Worker):
         ]
 
 def create_worker(
-    unit: str, 
+    unit: str,
     chunk_size: int,
     node_name: str,
     broker_addr: str,
